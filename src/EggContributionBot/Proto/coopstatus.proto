@@ -1,0 +1,378 @@
+syntax = "proto2";
+
+package Ei;
+
+option csharp_namespace = "EggContribBot.Proto";
+
+enum Platform {
+    UNKNOWN_PLATFORM = 0;
+    IOS = 1;
+    DROID = 2;
+}
+
+message BasicRequestInfo {
+    optional string ei_user_id = 1;
+    optional uint32 client_version = 2;
+    optional string version = 3;
+    optional string build = 4;
+    optional string platform = 5;
+    optional string country = 6;
+    optional string language = 7;
+    optional bool debug = 8;
+}
+
+message AuthenticatedMessage {
+    optional bytes message = 1;
+    optional string code = 2;
+    optional uint32 version = 3;
+    optional bool compressed = 4;
+    optional uint32 original_size = 5;
+    optional string user_id = 6;
+}
+
+message ContractCoopStatusRequest {
+    optional BasicRequestInfo rinfo = 5;
+    optional string contract_identifier = 1;
+    optional string coop_identifier = 2;
+    optional string user_id = 3;
+    optional uint32 client_version = 4;
+    optional double client_timestamp = 6;
+}
+
+message Backup {
+    optional string user_id = 1;
+    optional string ei_user_id = 18;
+    optional string user_name = 2;
+    optional Stats stats = 6;
+    optional Game game = 7;
+    repeated Simulation farms = 12;
+    optional MyContracts contracts = 13;
+    optional ArtifactsDB artifacts_db = 15;
+
+    message Stats {
+        repeated double egg_totals = 8;
+    }
+
+    message Simulation {
+        optional Egg egg_type = 1;
+        optional double eggs_laid = 9;
+        optional string contract_id = 20;
+    }
+
+    message Game {
+        optional uint64 soul_eggs = 4;
+        optional uint64 unclaimed_soul_eggs = 17;
+        optional double soul_eggs_d = 34;
+        optional double unclaimed_soul_eggs_d = 35;
+        optional uint64 eggs_of_prophecy = 23;
+        optional uint64 unclaimed_eggs_of_prophecy = 24;
+        optional uint32 permit_level = 8;
+        repeated ResearchItem epic_research = 9;
+    }
+
+    message ResearchItem {
+        optional string id = 1;
+        optional uint32 level = 2;
+    }
+}
+
+enum Egg {
+    EDIBLE = 1;
+    SUPERFOOD = 2;
+    MEDICAL = 3;
+    ROCKET_FUEL = 4;
+    SUPER_MATERIAL = 5;
+    FUSION = 6;
+    QUANTUM = 7;
+    IMMORTALITY = 8;
+    TACHYON = 9;
+    GRAVITON = 10;
+    DILITHIUM = 11;
+    PRODIGY = 12;
+    TERRAFORM = 13;
+    ANTIMATTER = 14;
+    DARK_MATTER = 15;
+    AI = 16;
+    NEBULA = 17;
+    UNIVERSE = 18;
+    ENLIGHTENMENT = 19;
+    CURIOSITY = 50;
+    INTEGRITY = 51;
+    HUMILITY = 52;
+    RESILIENCE = 53;
+    KINDNESS = 54;
+    CHOCOLATE = 100;
+    EASTER = 101;
+    WATERBALLOON = 102;
+    FIREWORK = 103;
+    PUMPKIN = 104;
+    CUSTOM_EGG = 200;
+    UNKNOWN = 1000;
+}
+
+enum GoalType {
+    EGGS_LAID = 1;
+}
+
+enum RewardType {
+    GOLD = 1;
+}
+
+message GameModifier {
+    optional double value = 2;
+    optional string description = 3;
+}
+
+message CustomEgg {
+    optional string identifier = 1;
+    optional string name = 2;
+}
+
+message Contract {
+    optional string identifier = 1;
+    optional string name = 9;
+    optional string description = 10;
+    optional Egg egg = 2;
+    optional string custom_egg_id = 25;
+
+    repeated Goal goals = 3;
+    message Goal {
+        optional GoalType type = 1;
+        optional double target_amount = 2;
+        optional RewardType reward_type = 3;
+        optional string reward_sub_type = 4;
+        optional double reward_amount = 5;
+        optional double target_soul_eggs = 6;
+    }
+
+    repeated GoalSet goal_sets = 16;
+    message GoalSet {
+        repeated Goal goals = 1;
+    }
+
+    repeated GradeSpec grade_specs = 20;
+    message GradeSpec {
+        optional PlayerGrade grade = 1;
+        repeated Goal goals = 2;
+        repeated GameModifier modifiers = 3;
+        optional double length_seconds = 4;
+    }
+
+    optional string season_id = 23;
+    optional bool coop_allowed = 4;
+    optional uint32 max_coop_size = 5;
+    optional uint32 max_boosts = 12;
+    optional double minutes_per_token = 15 [default = 60];
+    optional double start_time = 17;
+    optional double expiration_time = 6;
+    optional double length_seconds = 7;
+    optional bool leggacy = 19;
+    optional bool cc_only = 22;
+
+    enum PlayerGrade {
+        GRADE_UNSET = 0;
+        GRADE_C = 1;
+        GRADE_B = 2;
+        GRADE_A = 3;
+        GRADE_AA = 4;
+        GRADE_AAA = 5;
+    }
+}
+
+message ContractsResponse {
+    repeated Contract contracts = 1;
+    repeated CustomEgg custom_eggs = 6;
+    optional string warning_message = 4;
+    optional double server_time = 2;
+    optional uint32 max_eop = 3 [default = 1000];
+}
+
+message PeriodicalsResponse {
+    optional ContractsResponse contracts = 3;
+}
+
+message GetPeriodicalsRequest {
+    optional BasicRequestInfo rinfo = 12;
+    optional string user_id = 1;
+    optional bool piggy_full = 2;
+    optional bool piggy_found_full = 3;
+    optional double seconds_full_realtime = 4;
+    optional double seconds_full_gametime = 5;
+    optional double soul_eggs = 8;
+    optional uint32 current_client_version = 10;
+    optional bool debug = 11;
+}
+
+message ContractCoopStatusResponse {
+    enum ResponseStatus {
+        NO_ERROR = 0;
+        MISSING_USER = 1;
+        MISSING_COOP_ID = 2;
+        MISSING_CONTRACT_ID = 3;
+        MEMBERSHIP_NOT_FOUND = 4;
+        COOP_NOT_FOUND = 5;
+        CONTRACT_NOT_FOUND = 6;
+        INVALID_MEMBERSHIP = 7;
+        NO_HTTP_RESPONSE = 500;
+    }
+
+    message ContributionInfo {
+        optional string user_id = 1;
+        optional string user_name = 2;
+        optional double contribution_amount = 3;
+        optional bool active = 4;
+        optional double contribution_rate = 6;
+        optional bool time_cheat_detected = 7;
+        optional bool recently_active = 23;
+    }
+
+    optional string contract_identifier = 1;
+    optional double total_amount = 2;
+    optional string coop_identifier = 3;
+    repeated ContributionInfo contributors = 4;
+    optional bool auto_generated = 8;
+    optional ResponseStatus response_status = 19;
+}
+
+message LocalContract {
+    optional Contract contract = 1;
+    optional string contract_identifier = 24;
+    optional string coop_identifier = 2;
+    optional bool accepted = 7;
+    optional double time_accepted = 3;
+    optional bool cancelled = 4;
+    optional double coop_shared_end_time = 5;
+    optional uint32 league = 15;
+    optional Contract.PlayerGrade grade = 18;
+}
+
+message MyContracts {
+    repeated LocalContract contracts = 1;
+    repeated LocalContract archive = 2;
+    repeated ContractCoopStatusResponse current_coop_statuses = 4;
+}
+
+message ArtifactSpec {
+    optional Name name = 1;
+    enum Name {
+        LUNAR_TOTEM = 0;
+        TACHYON_STONE = 1;
+        TACHYON_STONE_FRAGMENT = 2;
+        NEODYMIUM_MEDALLION = 3;
+        BEAK_OF_MIDAS = 4;
+        LIGHT_OF_EGGENDIL = 5;
+        DEMETERS_NECKLACE = 6;
+        VIAL_MARTIAN_DUST = 7;
+        ORNATE_GUSSET = 8;
+        THE_CHALICE = 9;
+        BOOK_OF_BASAN = 10;
+        PHOENIX_FEATHER = 11;
+        TUNGSTEN_ANKH = 12;
+        EXTRATERRESTRIAL_ALUMINUM = 13;
+        ANCIENT_TUNGSTEN = 14;
+        SPACE_ROCKS = 15;
+        ALIEN_WOOD = 16;
+        GOLD_METEORITE = 17;
+        TAU_CETI_GEODE = 18;
+        CENTAURIAN_STEEL = 19;
+        ERIDANI_FEATHER = 20;
+        AURELIAN_BROOCH = 21;
+        CARVED_RAINSTICK = 22;
+        PUZZLE_CUBE = 23;
+        QUANTUM_METRONOME = 24;
+        SHIP_IN_A_BOTTLE = 25;
+        TACHYON_DEFLECTOR = 26;
+        INTERSTELLAR_COMPASS = 27;
+        DILITHIUM_MONOCLE = 28;
+        TITANIUM_ACTUATOR = 29;
+        MERCURYS_LENS = 30;
+        DILITHIUM_STONE = 31;
+        SHELL_STONE = 32;
+        LUNAR_STONE = 33;
+        SOUL_STONE = 34;
+        DRONE_PARTS = 35;
+        QUANTUM_STONE = 36;
+        TERRA_STONE = 37;
+        LIFE_STONE = 38;
+        PROPHECY_STONE = 39;
+        CLARITY_STONE = 40;
+        CELESTIAL_BRONZE = 41;
+        LALANDE_HIDE = 42;
+        SOLAR_TITANIUM = 43;
+        DILITHIUM_STONE_FRAGMENT = 44;
+        SHELL_STONE_FRAGMENT = 45;
+        LUNAR_STONE_FRAGMENT = 46;
+        SOUL_STONE_FRAGMENT = 47;
+        PROPHECY_STONE_FRAGMENT = 48;
+        QUANTUM_STONE_FRAGMENT = 49;
+        TERRA_STONE_FRAGMENT = 50;
+        LIFE_STONE_FRAGMENT = 51;
+        CLARITY_STONE_FRAGMENT = 52;
+        UNKNOWN = 10000;
+    }
+
+    optional Level level = 2;
+    enum Level {
+        INFERIOR = 0;
+        LESSER = 1;
+        NORMAL = 2;
+        GREATER = 3;
+        SUPERIOR = 4;
+    }
+
+    optional Rarity rarity = 3;
+    enum Rarity {
+        COMMON = 0;
+        RARE = 1;
+        EPIC = 2;
+        LEGENDARY = 3;
+    }
+
+    optional Egg egg = 4;
+}
+
+message CompleteArtifact {
+    optional ArtifactSpec spec = 1;
+    repeated ArtifactSpec stones = 2;
+}
+
+message ArtifactInventoryItem {
+    optional uint64 item_id = 1;
+    optional CompleteArtifact artifact = 2;
+    optional double quantity = 3;
+    optional string server_id = 4;
+}
+
+message ActiveArtifactSlot {
+    optional bool occupied = 1;
+    optional uint64 item_id = 2;
+}
+
+message ArtifactsDB {
+    repeated ArtifactInventoryItem inventory_items = 1;
+
+    repeated ActiveArtifactSet active_artifact_sets = 11;
+    message ActiveArtifactSet {
+        repeated ActiveArtifactSlot slots = 1;
+        optional uint32 uid = 2;
+    }
+
+    repeated ActiveArtifactSet saved_artifact_sets = 13;
+}
+
+message EggIncFirstContactRequest {
+    optional BasicRequestInfo rinfo = 8;
+    optional string ei_user_id = 4;
+    optional string user_id = 1;
+    optional string device_id = 5;
+    optional string username = 6;
+    optional uint32 client_version = 2;
+    optional Platform platform = 3;
+}
+
+message EggIncFirstContactResponse {
+    optional Backup backup = 1;
+    optional string ei_user_id = 2;
+    optional uint32 error_code = 4 [default = 0];
+    optional string error_message = 5;
+}

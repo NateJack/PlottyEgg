@@ -1,0 +1,26 @@
+# Build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Local secrets and private bot data
+appsettings.json
+**/appsettings.json
+data/
+**/data/
+*.key
+*.bin
+
+# Runtime logs
+*.log
+*.tmp
+
+# Imported reference material, not part of the runnable bot
+EGG9000-master/
+ImportedBot/
+
+# Codex/local workspace files
+.agents/
+.codex/
