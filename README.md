@@ -4,6 +4,10 @@ Plotty is a local Discord bot for an Egg Inc guild. It tracks registered player 
 
 The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 
+## Proto Source
+
+`src/EggContributionBot/Proto/coopstatus.proto` is based on `ei.proto` from [elgranjero/EggIncProtos](https://github.com/elgranjero/EggIncProtos), which is licensed GPL-2.0. The bot adds a C# namespace option so generated classes stay under `EggContribBot.Proto`.
+
 ## Current Features
 
 ### Player Commands

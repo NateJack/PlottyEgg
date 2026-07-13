@@ -147,7 +147,8 @@ client.ButtonExecuted += async component => {
             var displayName = user?.DisplayName ?? accounts.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a.EggName))?.EggName ?? "Registered Player";
             var embeds = new List<Embed>();
             foreach(var account in accounts.Take(10)) {
-                embeds.Add(await BuildPlayerEmbedAsync(account, displayName));
+                var backup = await eggClient.GetBackupAsync(account.Eid);
+                embeds.Add(await BuildPlayerEmbedAsync(account, displayName, backup));
             }
 
             await component.UpdateAsync(message => {
@@ -334,7 +335,7 @@ async Task HandleRegisteredRatesAsync(SocketSlashCommand command) {
             .Select(s => BuildContributionEmbed(s.ContractId, s.CoopCode, s.Status, showCoopCode: false, titleSuffix: $"(running - {accountLabel})"))
             .Where(e => e is not null)
             .Cast<Embed>());
-        completedEmbeds.AddRange(await BuildRecentCompletedRateEmbedsAsync(account, lookup.StatusLookups));
+        completedEmbeds.AddRange(await BuildRecentCompletedRateEmbedsAsync(account, lookup.Backup, lookup.StatusLookups));
         if(lookup.Statuses.Count == 0) {
             diagnostics.Add($"**{accountLabel}**\n{BuildCoopLookupDiagnostic(lookup)}");
         }
@@ -359,8 +360,8 @@ async Task HandleRegisteredRatesAsync(SocketSlashCommand command) {
 
 async Task<IReadOnlyList<Embed>> BuildRecentCompletedRateEmbedsAsync(
     RegisteredEggAccount account,
+    Backup? backup,
     IReadOnlyCollection<PlayerCoopStatusLookup> runningLookups) {
-    var backup = await eggClient.GetBackupAsync(account.Eid);
     if(backup?.Contracts is null) {
         return [];
     }
@@ -489,7 +490,8 @@ async Task HandlePlayerAsync(SocketSlashCommand command) {
 
     var embeds = new List<Embed>();
     foreach(var account in accounts.Take(10)) {
-        embeds.Add(await BuildPlayerEmbedAsync(account, displayName));
+        var backup = await eggClient.GetBackupAsync(account.Eid);
+        embeds.Add(await BuildPlayerEmbedAsync(account, displayName, backup));
     }
 
     await command.FollowupAsync(
@@ -1313,8 +1315,7 @@ Embed? BuildRegisteredContractEmbed(
         .Build();
 }
 
-async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string displayName) {
-    var backup = await eggClient.GetBackupAsync(account.Eid);
+async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string displayName, Backup? backup) {
     var builder = new EmbedBuilder()
         .WithTitle($"Player - {displayName} ({AccountDisplayName(account)})")
         .WithColor(Color.Blue)

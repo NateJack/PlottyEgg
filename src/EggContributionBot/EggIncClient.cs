@@ -221,6 +221,7 @@ public sealed class EggIncClient {
             return new PlayerCoopLookupResult(
                 [],
                 [],
+                backup,
                 BackupFound: backup is not null,
                 ContractsFound: false,
                 FarmCount: backup?.Farms.Count ?? 0,
@@ -295,6 +296,7 @@ public sealed class EggIncClient {
         return new PlayerCoopLookupResult(
             results,
             statusLookups,
+            backup,
             BackupFound: true,
             ContractsFound: true,
             FarmCount: backup.Farms.Count,
@@ -414,6 +416,7 @@ public sealed class EggIncClient {
 public sealed record PlayerCoopLookupResult(
     IReadOnlyList<(string ContractId, string CoopCode, ContractCoopStatusResponse Status)> Statuses,
     IReadOnlyList<PlayerCoopStatusLookup> StatusLookups,
+    Backup? Backup,
     bool BackupFound,
     bool ContractsFound,
     int FarmCount,
