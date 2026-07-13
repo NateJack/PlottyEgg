@@ -15,6 +15,7 @@ var secureText = new SecureText(settings.Storage.KeyPath);
 var dataStore = new DataStore(settings.Storage.DataPath, secureText);
 var eggClient = new EggIncClient();
 var wikiClient = new EggWikiClient();
+var missingJoinMonitorStarted = false;
 
 var client = new DiscordSocketClient(new DiscordSocketConfig {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMembers | GatewayIntents.GuildMessages | GatewayIntents.MessageContent,
@@ -38,6 +39,10 @@ client.Ready += async () => {
         await client.Rest.BulkOverwriteGlobalCommands([]);
         await guild.BulkOverwriteApplicationCommandAsync(commands);
         Console.WriteLine($"Logged in as {client.CurrentUser}; registered {commands.Length} commands in {guild.Name}.");
+        if(!missingJoinMonitorStarted) {
+            missingJoinMonitorStarted = true;
+            _ = Task.Run(() => MonitorMissingCoopJoinsAsync(guildId));
+        }
     } else {
         await client.Rest.BulkOverwriteGlobalCommands(commands);
         Console.WriteLine($"Logged in as {client.CurrentUser}; registered {commands.Length} global commands.");
@@ -552,6 +557,161 @@ async Task HandleDashboardButtonAsync(SocketMessageComponent component) {
 
     }
 }
+
+async Task MonitorMissingCoopJoinsAsync(ulong guildId) {
+    await Task.Delay(TimeSpan.FromMinutes(2));
+    using var timer = new PeriodicTimer(TimeSpan.FromMinutes(30));
+    while(true) {
+        try {
+            await CheckMissingCoopJoinsAsync(guildId);
+        } catch(Exception ex) {
+            Console.WriteLine($"Missing coop join monitor failed: {ex}");
+        }
+
+        await timer.WaitForNextTickAsync();
+    }
+}
+
+async Task CheckMissingCoopJoinsAsync(ulong guildId) {
+    var guild = client.GetGuild(guildId);
+    if(guild is null) {
+        return;
+    }
+
+    var staffChannel = FindStaffTextChannel(guild);
+    if(staffChannel is null) {
+        Console.WriteLine("Missing coop join monitor could not find a Staff text channel.");
+        return;
+    }
+
+    var now = DateTimeOffset.UtcNow;
+    var currentContracts = (await eggClient.GetCurrentContractsAsync())
+        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
+        .Where(c => c.CoopAllowed)
+        .Where(c => c.StartTime > 0)
+        .Where(c => DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime).AddHours(6) <= now)
+        .Where(c => c.ExpirationTime <= 0 || DateTimeOffset.FromUnixTimeSeconds((long)c.ExpirationTime) > now)
+        .GroupBy(c => c.Identifier, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.OrderByDescending(c => c.StartTime).First())
+        .ToList();
+    if(currentContracts.Count == 0) {
+        return;
+    }
+
+    var accounts = await dataStore.GetRegisteredEidsAsync(guildId);
+    if(accounts.Count == 0) {
+        return;
+    }
+
+    var snapshots = new List<MissingJoinAccountSnapshot>();
+    foreach(var account in accounts) {
+        var backup = await eggClient.GetBackupAsync(account.Eid);
+        snapshots.Add(BuildMissingJoinSnapshot(account, backup));
+    }
+
+    foreach(var contract in currentContracts) {
+        var contractId = contract.Identifier;
+        var startedAt = DateTimeOffset.FromUnixTimeSeconds((long)contract.StartTime);
+        var alertKey = $"missing-join:{guildId}:{contractId.ToLowerInvariant()}:{startedAt.ToUnixTimeSeconds()}";
+        if(await dataStore.HasMissingJoinAlertAsync(alertKey)) {
+            continue;
+        }
+
+        var joinedDiscordUsers = snapshots
+            .Where(s => s.JoinedContractIds.Contains(contractId))
+            .Select(s => s.Account.DiscordUserId)
+            .ToHashSet();
+        if(joinedDiscordUsers.Count == 0) {
+            continue;
+        }
+
+        var missingMembers = snapshots
+            .Where(s => !joinedDiscordUsers.Contains(s.Account.DiscordUserId))
+            .GroupBy(s => s.Account.DiscordUserId)
+            .Select(g => {
+                var first = g.First();
+                var guildUser = guild.GetUser(first.Account.DiscordUserId);
+                var label = guildUser is not null
+                    ? guildUser.Mention
+                    : AccountDisplayName(first.Account);
+                return new MissingJoinMember(first.Account.DiscordUserId, label, g.Select(s => s.Account).ToList());
+            })
+            .OrderBy(m => NormalizeName(m.Label))
+            .ToList();
+
+        if(missingMembers.Count == 0) {
+            await dataStore.RecordMissingJoinAlertAsync(alertKey);
+            continue;
+        }
+
+        var embed = BuildMissingJoinEmbed(contract, startedAt, missingMembers);
+        await PostMissingJoinAlertAsync(staffChannel, contractId, embed);
+        await dataStore.RecordMissingJoinAlertAsync(alertKey);
+    }
+}
+
+MissingJoinAccountSnapshot BuildMissingJoinSnapshot(RegisteredEggAccount account, Backup? backup) {
+    var joined = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if(backup is not null) {
+        foreach(var farmContractId in backup.Farms
+            .Select(f => f.ContractId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))) {
+            joined.Add(farmContractId);
+        }
+
+        if(backup.Contracts is not null) {
+            foreach(var contract in backup.Contracts.Contracts
+                .Where(c => c.Accepted && !c.Cancelled)
+                .Select(GetLocalContractId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))) {
+                joined.Add(contract);
+            }
+        }
+    }
+
+    return new MissingJoinAccountSnapshot(account, joined);
+}
+
+Embed BuildMissingJoinEmbed(Contract contract, DateTimeOffset startedAt, IReadOnlyList<MissingJoinMember> missingMembers) {
+    var lines = missingMembers
+        .Take(30)
+        .Select(m => {
+            var accountCount = m.Accounts.Count;
+            var accountText = accountCount == 1
+                ? AccountDisplayName(m.Accounts[0])
+                : $"{accountCount} registered EIDs";
+            return $"- {m.Label} ({accountText})";
+        })
+        .ToList();
+    if(missingMembers.Count > lines.Count) {
+        lines.Add($"...and {missingMembers.Count - lines.Count} more.");
+    }
+
+    return new EmbedBuilder()
+        .WithTitle($"Missing Co-op Joins - {contract.Identifier}")
+        .WithColor(Color.Orange)
+        .WithDescription(string.Join("\n", lines))
+        .AddField("Contract", string.IsNullOrWhiteSpace(contract.Name) ? contract.Identifier : contract.Name)
+        .AddField("Started", $"{startedAt.LocalDateTime:yyyy-MM-dd HH:mm} local")
+        .AddField("Check", "6 hours after contract start")
+        .WithFooter("Mentions are displayed without pings.")
+        .WithCurrentTimestamp()
+        .Build();
+}
+
+async Task PostMissingJoinAlertAsync(SocketTextChannel staffChannel, string contractId, Embed embed) {
+    var threadName = TrimForDiscordName($"Missing joins - {contractId}");
+    try {
+        var thread = await staffChannel.CreateThreadAsync(threadName, ThreadType.PublicThread, ThreadArchiveDuration.OneDay);
+        await thread.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not create staff thread for missing joins: {ex}");
+        await staffChannel.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+    }
+}
+
+static SocketTextChannel? FindStaffTextChannel(SocketGuild guild) =>
+    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "staff");
 
 async Task HandleDemeritAsync(SocketSlashCommand command) {
     var staffUser = command.User as SocketGuildUser;
@@ -1818,6 +1978,16 @@ static bool IsStaffChannel(IChannel? channel) =>
     channel is IGuildChannel guildChannel &&
     NormalizeName(guildChannel.Name) == "staff";
 
+static string TrimForDiscordName(string value) {
+    var cleaned = Regex.Replace(value.ToLowerInvariant(), @"[^a-z0-9\-_ ]", "").Trim();
+    cleaned = Regex.Replace(cleaned, @"\s+", "-");
+    if(string.IsNullOrWhiteSpace(cleaned)) {
+        return "plotty-alert";
+    }
+
+    return cleaned.Length <= 90 ? cleaned : cleaned[..90].Trim('-');
+}
+
 static string FormatDuration(TimeSpan duration) {
     if(duration <= TimeSpan.Zero) {
         return "now";
@@ -2264,6 +2434,9 @@ public sealed record DashboardPlayerRow(
     DashboardCategory Category,
     string Reason);
 public sealed record AutoDemeritCandidate(ulong DiscordUserId, string ContractId, double RatePerHour, string PlayerName, string SourceKey);
+public sealed record MissingJoinAccountSnapshot(RegisteredEggAccount Account, IReadOnlySet<string> JoinedContractIds);
+public sealed record MissingJoinMember(ulong DiscordUserId, string Label, IReadOnlyList<RegisteredEggAccount> Accounts);
+public sealed record MissingJoinAlert(string Key, DateTimeOffset PostedAt);
 public sealed record BeerStats(
     ulong GuildId,
     ulong DiscordUserId,
@@ -2639,6 +2812,33 @@ public sealed class DataStore {
         }
     }
 
+    public async Task<bool> HasMissingJoinAlertAsync(string key) {
+        await _gate.WaitAsync();
+        try {
+            var state = await LoadAsync();
+            return state.MissingJoinAlerts.Any(a => a.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
+        } finally {
+            _gate.Release();
+        }
+    }
+
+    public async Task RecordMissingJoinAlertAsync(string key) {
+        await _gate.WaitAsync();
+        try {
+            var state = await LoadAsync();
+            if(state.MissingJoinAlerts.Any(a => a.Key.Equals(key, StringComparison.OrdinalIgnoreCase))) {
+                return;
+            }
+
+            var cutoff = DateTimeOffset.UtcNow.AddDays(-90);
+            state.MissingJoinAlerts.RemoveAll(a => a.PostedAt < cutoff);
+            state.MissingJoinAlerts.Add(new MissingJoinAlert(key, DateTimeOffset.UtcNow));
+            await SaveAsync(state);
+        } finally {
+            _gate.Release();
+        }
+    }
+
     public async Task<BeerAttemptResult> TryAddPlottyBeerAsync(ulong guildId, ulong discordUserId, bool botBuysBack, bool bypassCooldown = false) {
         await _gate.WaitAsync();
         try {
@@ -2769,6 +2969,7 @@ public sealed class DataStore {
         public List<EggUserLink> Links { get; set; } = [];
         public List<RegisteredEid> RegisteredEids { get; set; } = [];
         public List<DemeritEntry> Demerits { get; set; } = [];
+        public List<MissingJoinAlert> MissingJoinAlerts { get; set; } = [];
         public List<BeerStats> BeerStats { get; set; } = [];
         public List<BeerGiftLog> BeerGiftLogs { get; set; } = [];
     }

@@ -22,6 +22,7 @@ The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 - `/admin-dashboard` shows staff overview data for registered players, low rates, sync issues, and likely unboosted players.
 - `/admin-demerit` adds, removes, or lists demerits. Demerits expire after 30 days.
 - `/admin-plotty-speak` lets staff send a message as Plotty.
+- 6 hours after a contract starts, Plotty automatically posts a Staff-thread alert listing registered members who have not joined the contract yet.
 
 Admin commands can only be run by members with the `Staff` role and must be used in the `Staff` channel.
 
