@@ -80,7 +80,9 @@ public sealed class EggIncClient {
             req.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
 
             var sessionCookie = Environment.GetEnvironmentVariable("EGGINC_SESSION_COOKIE");
-            req.Headers.Add("cookie", $"session={(!string.IsNullOrWhiteSpace(sessionCookie) ? sessionCookie : "9cd692e4-050e-4cb9-a305-993bd28441b2")}");
+            if(!string.IsNullOrWhiteSpace(sessionCookie)) {
+                req.Headers.Add("cookie", $"session={sessionCookie}");
+            }
         } else {
             req.Headers.UserAgent.ParseAdd("Dalvik/2.1.0 (Linux; U; Android 9; SM-G960U1 Build/PPR1.180610.011)");
             req.Headers.AcceptEncoding.ParseAdd("gzip");
