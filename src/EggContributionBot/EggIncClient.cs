@@ -12,9 +12,9 @@ public sealed class EggIncClient {
     private const string PeriodicalsReferenceUserId = "EI5482515761594368";
     private const string PeriodicalsPostUserId = "EI4765194876354560";
     private const uint ClientVersion = 72;
-    private const string AppVersion = "1.35.6";
-    private const string AppBuild = "1.35.6.3";
-    private const string UserAgent = "egginc/1.35.3.1 CFNetwork/1410.1 Darwin/22.6.0";
+    private const string AppVersion = "1.35.7";
+    private const string AppBuild = "111343";
+    private const string UserAgent = "egginc/1.35.7 CFNetwork/1410.1 Darwin/22.6.0";
 
     private readonly HttpClient _http;
 

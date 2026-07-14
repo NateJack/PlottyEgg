@@ -1646,14 +1646,13 @@ Embed BuildEggsLaidEmbed(Backup backup, RegisteredEggAccount? account = null) {
         .WithColor(Color.Green)
         .WithCurrentTimestamp();
 
-    var totals = backup.Stats?.EggTotals?.ToList() ?? [];
+    var totals = BuildEggsLaidTotals(backup);
     if(totals.Count == 0) {
         builder.WithDescription("No lifetime egg totals were found in this backup.");
         return builder.Build();
     }
 
     var lines = totals
-        .Select((amount, index) => new { Name = EggNameForStatsIndex(index), Amount = amount })
         .Where(x => x.Amount > 0)
         .Select(x => $"**{x.Name}** - {FormatEggs(x.Amount)}")
         .ToList();
@@ -1681,6 +1680,55 @@ Embed BuildEggsLaidEmbed(Backup backup, RegisteredEggAccount? account = null) {
 
     return builder.Build();
 }
+
+static IReadOnlyList<EggsLaidTotal> BuildEggsLaidTotals(Backup backup) {
+    var statsTotals = backup.Stats?.EggTotals?.ToList() ?? [];
+    var totals = new List<EggsLaidTotal>();
+
+    for(var i = 0; i < Math.Min(19, statsTotals.Count); i++) {
+        totals.Add(new EggsLaidTotal(EggNameForStatsIndex(i), statsTotals[i]));
+    }
+
+    for(var i = 20; i < Math.Min(25, statsTotals.Count); i++) {
+        totals.Add(new EggsLaidTotal(EggNameForStatsIndex(i), statsTotals[i]));
+    }
+
+    var contracts = backup.Contracts?.Archive
+        .Concat(backup.Contracts.Contracts)
+        .ToList() ?? [];
+
+    Egg[] seasonalEggs = [
+        Egg.Chocolate,
+        Egg.Easter,
+        Egg.Waterballoon,
+        Egg.Firework,
+        Egg.Pumpkin
+    ];
+
+    foreach(var egg in seasonalEggs) {
+        totals.Add(new EggsLaidTotal(
+            EggDisplayName(egg),
+            SumContractEggsLaid(contracts.Where(c => c.Contract?.Egg == egg))));
+    }
+
+    var customEggs = backup.Contracts?.CustomEggInfo ?? [];
+    foreach(var customEgg in customEggs.Where(e => !string.IsNullOrWhiteSpace(e.Identifier))) {
+        var name = string.IsNullOrWhiteSpace(customEgg.Name)
+            ? $"Custom Egg ({customEgg.Identifier})"
+            : customEgg.Name;
+        totals.Add(new EggsLaidTotal(
+            name,
+            SumContractEggsLaid(contracts.Where(c =>
+                string.Equals(c.Contract?.CustomEggId, customEgg.Identifier, StringComparison.OrdinalIgnoreCase)))));
+    }
+
+    return totals;
+}
+
+static double SumContractEggsLaid(IEnumerable<LocalContract> contracts) =>
+    contracts.Sum(c => c.CoopLastUploadedContribution > 0
+        ? c.CoopLastUploadedContribution
+        : c.LastAmountWhenRewardGiven);
 
 Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) {
     var titleName = AccountDisplayName(account);
@@ -1727,7 +1775,7 @@ Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) 
         ? ["No equipped contract artifacts were visible in this backup."]
         : activeArtifacts
             .GroupBy(a => a.Name)
-            .Select(g => $"{ArtifactPurposeIcon(g.First().Purpose)} **{g.First().DisplayName}** x{g.Count()}")
+            .Select(g => $"{ArtifactPurposeIcon(g.First().Purpose)} **{g.First().DisplayName}** x{g.Count()} - {FormatArtifactMultiplier(g.First())}")
             .Take(8)
             .ToList();
 
@@ -1739,7 +1787,7 @@ Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) 
         builder.AddField("Suggested Set", "No contract-focused artifacts were found. Look for Tachyon Deflector, Quantum Metronome, Interstellar Compass, and useful stones.");
     } else {
         builder.AddField("Suggested Set", string.Join("\n", suggested.Select((a, i) =>
-            $"{i + 1}. {ArtifactPurposeIcon(a.Purpose)} **{a.DisplayName}**{FormatArtifactStones(a.Artifact)} - {a.Reason}")));
+            $"{i + 1}. {ArtifactPurposeIcon(a.Purpose)} **{a.DisplayName}**{FormatArtifactStones(a.Artifact)} - {FormatArtifactMultiplier(a)}; {a.Reason}")));
 
         var imageLinks = suggested
             .Where(a => !string.IsNullOrWhiteSpace(a.ImageUrl))
@@ -1751,7 +1799,7 @@ Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) 
         }
     }
 
-    builder.WithFooter("Heuristic recommendation. Plotty can only inspect equipped artifacts from backups it can pull.");
+    builder.WithFooter("Effect-aware recommendation using Wasmegg-style artifact values. Plotty can only inspect backups it can pull.");
     return builder.Build();
 }
 
@@ -1776,9 +1824,23 @@ static ArtifactCandidate? CreateArtifactCandidate(ArtifactInventoryItem item) {
 
     var name = spec.Name;
     var displayName = ArtifactDisplayName(spec);
-    var stoneScore = artifact.Stones.Sum(ArtifactStoneScore);
-    var rarityScore = (int)spec.Rarity * 25;
-    var levelScore = (int)spec.Level * 100;
+    var layingMultiplier = ArtifactEffectMultiplier(artifact, [
+        ArtifactSpec.Types.Name.QuantumMetronome,
+        ArtifactSpec.Types.Name.TachyonStone
+    ]);
+    var shippingMultiplier = ArtifactEffectMultiplier(artifact, [
+        ArtifactSpec.Types.Name.InterstellarCompass,
+        ArtifactSpec.Types.Name.QuantumStone
+    ]);
+    var capacityMultiplier = ArtifactEffectMultiplier(artifact, [ArtifactSpec.Types.Name.OrnateGusset]);
+    var teamLayingMultiplier = ArtifactEffectMultiplier(artifact, [ArtifactSpec.Types.Name.TachyonDeflector]);
+    var teamEarningsMultiplier = ArtifactEffectMultiplier(artifact, [ArtifactSpec.Types.Name.ShipInABottle]);
+    var boostMultiplier = ArtifactEffectMultiplier(artifact, [ArtifactSpec.Types.Name.DilithiumMonocle]);
+    var internalHatcheryMultiplier = ArtifactEffectMultiplier(artifact, [
+        ArtifactSpec.Types.Name.TheChalice,
+        ArtifactSpec.Types.Name.LifeStone
+    ]);
+    var stoneCarrierScore = StoneCarrierScore(artifact);
 
     return name switch {
         ArtifactSpec.Types.Name.TachyonDeflector => new ArtifactCandidate(
@@ -1787,63 +1849,80 @@ static ArtifactCandidate? CreateArtifactCandidate(ArtifactInventoryItem item) {
             name,
             displayName,
             ArtifactPurpose.TeamLaying,
-            10000 + levelScore + rarityScore + stoneScore,
+            10000 + teamLayingMultiplier * 1000 + layingMultiplier * 75 + shippingMultiplier * 50 + stoneCarrierScore,
             "helps the co-op by raising teammate egg laying",
-            ArtifactImageUrl(name)),
+            ArtifactImageUrl(spec),
+            teamLayingMultiplier),
         ArtifactSpec.Types.Name.QuantumMetronome => new ArtifactCandidate(
             item,
             artifact,
             name,
             displayName,
             ArtifactPurpose.Laying,
-            9000 + levelScore + rarityScore + stoneScore,
+            9000 + layingMultiplier * 1000 + shippingMultiplier * 75 + stoneCarrierScore,
             "raises your egg laying rate",
-            ArtifactImageUrl(name)),
+            ArtifactImageUrl(spec),
+            layingMultiplier),
         ArtifactSpec.Types.Name.InterstellarCompass => new ArtifactCandidate(
             item,
             artifact,
             name,
             displayName,
             ArtifactPurpose.Shipping,
-            8500 + levelScore + rarityScore + stoneScore,
+            8500 + shippingMultiplier * 1000 + layingMultiplier * 75 + stoneCarrierScore,
             "raises shipping so laid eggs can actually leave the farm",
-            ArtifactImageUrl(name)),
+            ArtifactImageUrl(spec),
+            shippingMultiplier),
         ArtifactSpec.Types.Name.OrnateGusset => new ArtifactCandidate(
             item,
             artifact,
             name,
             displayName,
             ArtifactPurpose.Capacity,
-            6500 + levelScore + rarityScore + stoneScore,
+            6500 + capacityMultiplier * 1000 + stoneCarrierScore,
             "keeps hab space from choking production",
-            ArtifactImageUrl(name)),
+            ArtifactImageUrl(spec),
+            capacityMultiplier),
         ArtifactSpec.Types.Name.ShipInABottle => new ArtifactCandidate(
             item,
             artifact,
             name,
             displayName,
             ArtifactPurpose.TeamEarnings,
-            4500 + levelScore + rarityScore + stoneScore,
+            4500 + teamEarningsMultiplier * 700 + stoneCarrierScore,
             "supports co-op earnings after core rate artifacts",
-            ArtifactImageUrl(name)),
+            ArtifactImageUrl(spec),
+            teamEarningsMultiplier),
         ArtifactSpec.Types.Name.DilithiumMonocle => new ArtifactCandidate(
             item,
             artifact,
             name,
             displayName,
             ArtifactPurpose.Boosting,
-            3500 + levelScore + rarityScore + stoneScore,
+            3500 + boostMultiplier * 700 + stoneCarrierScore,
             "helps boost sessions, but is secondary after rate artifacts",
-            ArtifactImageUrl(name)),
-        _ when artifact.Stones.Any(s => ArtifactStoneScore(s) > 0) => new ArtifactCandidate(
+            ArtifactImageUrl(spec),
+            boostMultiplier),
+        ArtifactSpec.Types.Name.TheChalice => new ArtifactCandidate(
+            item,
+            artifact,
+            name,
+            displayName,
+            ArtifactPurpose.InternalHatchery,
+            3200 + internalHatcheryMultiplier * 700 + stoneCarrierScore,
+            "helps contract population growth, especially with life stones",
+            ArtifactImageUrl(spec),
+            internalHatcheryMultiplier),
+        _ when stoneCarrierScore > 0 => new ArtifactCandidate(
             item,
             artifact,
             name,
             displayName,
             ArtifactPurpose.StoneCarrier,
-            2500 + levelScore + rarityScore + stoneScore,
+            2500 + stoneCarrierScore,
             "useful as a stone carrier if your best rate artifacts are already equipped",
-            ArtifactImageUrl(name)),
+            ArtifactImageUrl(spec),
+            ArtifactEffectMultiplier(artifact, artifact.Stones.Select(s => s.Name).Distinct().ToArray())),
         _ => null
     };
 }
@@ -1876,6 +1955,7 @@ static IEnumerable<ArtifactCandidate> BuildArtifactRecommendation(IReadOnlyList<
     AddBest(ArtifactPurpose.Capacity);
     AddBest(ArtifactPurpose.TeamEarnings);
     AddBest(ArtifactPurpose.Boosting);
+    AddBest(ArtifactPurpose.InternalHatchery);
     AddBest(ArtifactPurpose.StoneCarrier);
 
     return recommended.Take(4);
@@ -1896,15 +1976,257 @@ static IEnumerable<ArtifactCandidate> BuildArtifactRecommendation(IReadOnlyList<
     }
 }
 
-static double ArtifactStoneScore(ArtifactSpec stone) =>
-    stone.Name switch {
-        ArtifactSpec.Types.Name.TachyonStone => 700 + (int)stone.Level * 100 + (int)stone.Rarity * 25,
-        ArtifactSpec.Types.Name.QuantumStone => 650 + (int)stone.Level * 100 + (int)stone.Rarity * 25,
-        ArtifactSpec.Types.Name.ProphecyStone => 250 + (int)stone.Level * 60 + (int)stone.Rarity * 20,
-        ArtifactSpec.Types.Name.SoulStone => 200 + (int)stone.Level * 50 + (int)stone.Rarity * 20,
-        ArtifactSpec.Types.Name.ClarityStone => 150 + (int)stone.Level * 40 + (int)stone.Rarity * 15,
+static double StoneCarrierScore(CompleteArtifact artifact) {
+    var usefulStoneScore = artifact.Stones.Sum(s => (ArtifactSpecMultiplier(s) - 1) * 1000);
+    var slots = ArtifactStoneSlots(artifact.Spec);
+    return usefulStoneScore + slots * 125;
+}
+
+static double ArtifactEffectMultiplier(CompleteArtifact artifact, IReadOnlyCollection<ArtifactSpec.Types.Name> relevantNames) {
+    var multiplier = relevantNames.Contains(artifact.Spec.Name)
+        ? 1 + ArtifactEffectDelta(artifact.Spec)
+        : 1;
+    foreach(var stone in artifact.Stones.Where(s => relevantNames.Contains(s.Name))) {
+        multiplier *= 1 + ArtifactEffectDelta(stone);
+    }
+
+    return multiplier;
+}
+
+static double ArtifactSpecMultiplier(ArtifactSpec spec) => 1 + ArtifactEffectDelta(spec);
+
+static double ArtifactEffectDelta(ArtifactSpec spec) =>
+    spec.Name switch {
+        ArtifactSpec.Types.Name.TachyonDeflector => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => 0.08,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Rare => 0.13,
+                _ => 0.12
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 0.20,
+                ArtifactSpec.Types.Rarity.Epic => 0.19,
+                ArtifactSpec.Types.Rarity.Rare => 0.17,
+                _ => 0.15
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.QuantumMetronome => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Rare => 0.12,
+                _ => 0.10
+            },
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Epic => 0.20,
+                ArtifactSpec.Types.Rarity.Rare => 0.17,
+                _ => 0.15
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 0.35,
+                ArtifactSpec.Types.Rarity.Epic => 0.30,
+                ArtifactSpec.Types.Rarity.Rare => 0.27,
+                _ => 0.25
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.InterstellarCompass => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => 0.10,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Rare => 0.22,
+                _ => 0.20
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 0.50,
+                ArtifactSpec.Types.Rarity.Epic => 0.40,
+                ArtifactSpec.Types.Rarity.Rare => 0.35,
+                _ => 0.30
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.OrnateGusset => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Epic => 0.12,
+                _ => 0.10
+            },
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Rare => 0.16,
+                _ => 0.15
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 0.25,
+                ArtifactSpec.Types.Rarity.Epic => 0.22,
+                _ => 0.20
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.ShipInABottle => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.20,
+            ArtifactSpec.Types.Level.Lesser => 0.30,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Rare => 0.60,
+                _ => 0.50
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 1.00,
+                ArtifactSpec.Types.Rarity.Epic => 0.90,
+                ArtifactSpec.Types.Rarity.Rare => 0.80,
+                _ => 0.70
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.DilithiumMonocle => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => 0.10,
+            ArtifactSpec.Types.Level.Normal => 0.15,
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 0.30,
+                ArtifactSpec.Types.Rarity.Epic => 0.25,
+                _ => 0.20
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.TheChalice => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => 0.10,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Rare => 0.22,
+                _ => 0.20
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 0.50,
+                ArtifactSpec.Types.Rarity.Epic => 0.40,
+                ArtifactSpec.Types.Rarity.Rare => 0.35,
+                _ => 0.30
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.TachyonStone or
+        ArtifactSpec.Types.Name.QuantumStone => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.02,
+            ArtifactSpec.Types.Level.Lesser => 0.04,
+            ArtifactSpec.Types.Level.Normal => 0.05,
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.LifeStone => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.02,
+            ArtifactSpec.Types.Level.Lesser => 0.03,
+            ArtifactSpec.Types.Level.Normal => 0.04,
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.SoulStone => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.05,
+            ArtifactSpec.Types.Level.Lesser => 0.10,
+            ArtifactSpec.Types.Level.Normal => 0.20,
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.ProphecyStone => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.0005,
+            ArtifactSpec.Types.Level.Lesser => 0.0010,
+            ArtifactSpec.Types.Level.Normal => 0.0015,
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.ClarityStone => spec.Level switch {
+            ArtifactSpec.Types.Level.Inferior => 0.25,
+            ArtifactSpec.Types.Level.Lesser => 0.50,
+            ArtifactSpec.Types.Level.Normal => 1.00,
+            _ => 0
+        },
         _ => 0
     };
+
+static int ArtifactStoneSlots(ArtifactSpec spec) =>
+    spec.Name switch {
+        ArtifactSpec.Types.Name.TachyonDeflector => spec.Level switch {
+            ArtifactSpec.Types.Level.Normal => spec.Rarity == ArtifactSpec.Types.Rarity.Rare ? 1 : 0,
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary or ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.QuantumMetronome => spec.Level switch {
+            ArtifactSpec.Types.Level.Lesser => spec.Rarity == ArtifactSpec.Types.Rarity.Rare ? 1 : 0,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 3,
+                ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.InterstellarCompass => spec.Level switch {
+            ArtifactSpec.Types.Level.Normal => spec.Rarity == ArtifactSpec.Types.Rarity.Rare ? 1 : 0,
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary or ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.OrnateGusset => spec.Level switch {
+            ArtifactSpec.Types.Level.Lesser => spec.Rarity == ArtifactSpec.Types.Rarity.Epic ? 2 : 0,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity == ArtifactSpec.Types.Rarity.Rare ? 1 : 0,
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 3,
+                ArtifactSpec.Types.Rarity.Epic => 2,
+                _ => 0
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.ShipInABottle => spec.Level switch {
+            ArtifactSpec.Types.Level.Normal => spec.Rarity == ArtifactSpec.Types.Rarity.Rare ? 1 : 0,
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary or ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.DilithiumMonocle => spec.Level switch {
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 3,
+                ArtifactSpec.Types.Rarity.Epic => 2,
+                _ => 0
+            },
+            _ => 0
+        },
+        ArtifactSpec.Types.Name.TheChalice => spec.Level switch {
+            ArtifactSpec.Types.Level.Lesser => spec.Rarity == ArtifactSpec.Types.Rarity.Rare ? 1 : 0,
+            ArtifactSpec.Types.Level.Normal => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            ArtifactSpec.Types.Level.Greater => spec.Rarity switch {
+                ArtifactSpec.Types.Rarity.Legendary => 3,
+                ArtifactSpec.Types.Rarity.Epic => 2,
+                ArtifactSpec.Types.Rarity.Rare => 1,
+                _ => 0
+            },
+            _ => 0
+        },
+        _ => spec.Rarity switch {
+            ArtifactSpec.Types.Rarity.Legendary => 3,
+            ArtifactSpec.Types.Rarity.Epic => 2,
+            ArtifactSpec.Types.Rarity.Rare => 1,
+            _ => 0
+        }
+    };
+
+static string FormatArtifactMultiplier(ArtifactCandidate candidate) =>
+    candidate.Multiplier <= 1
+        ? "stone utility"
+        : $"{(candidate.Multiplier - 1) * 100:0.#}% effect";
 
 static string ArtifactDisplayName(ArtifactSpec spec) {
     var tier = spec.Level switch {
@@ -1947,30 +2269,42 @@ static string ArtifactPurposeIcon(ArtifactPurpose purpose) =>
         ArtifactPurpose.Capacity => "Capacity",
         ArtifactPurpose.TeamEarnings => "Earnings",
         ArtifactPurpose.Boosting => "Boosts",
+        ArtifactPurpose.InternalHatchery => "IHR",
         ArtifactPurpose.StoneCarrier => "Stones",
         _ => "Artifact"
     };
 
-static string? ArtifactImageUrl(ArtifactSpec.Types.Name name) {
-    var file = name switch {
-        ArtifactSpec.Types.Name.TachyonDeflector => "Tachyon_Deflector.png",
-        ArtifactSpec.Types.Name.QuantumMetronome => "Quantum_Metronome.png",
-        ArtifactSpec.Types.Name.InterstellarCompass => "Interstellar_Compass.png",
-        ArtifactSpec.Types.Name.OrnateGusset => "Ornate_Gusset.png",
-        ArtifactSpec.Types.Name.ShipInABottle => "Ship_in_a_Bottle.png",
-        ArtifactSpec.Types.Name.DilithiumMonocle => "Dilithium_Monocle.png",
-        ArtifactSpec.Types.Name.TachyonStone => "Tachyon_Stone.png",
-        ArtifactSpec.Types.Name.QuantumStone => "Quantum_Stone.png",
-        ArtifactSpec.Types.Name.ProphecyStone => "Prophecy_Stone.png",
-        ArtifactSpec.Types.Name.SoulStone => "Soul_Stone.png",
-        ArtifactSpec.Types.Name.ClarityStone => "Clarity_Stone.png",
+static string? ArtifactImageUrl(ArtifactSpec spec) {
+    var file = spec.Name switch {
+        ArtifactSpec.Types.Name.TachyonDeflector => $"afx_tachyon_deflector_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.QuantumMetronome => $"afx_quantum_metronome_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.InterstellarCompass => $"afx_interstellar_compass_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.OrnateGusset => $"afx_ornate_gusset_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.ShipInABottle => $"afx_ship_in_a_bottle_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.DilithiumMonocle => $"afx_dilithium_monocle_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.TheChalice => $"afx_the_chalice_{ArtifactAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.TachyonStone => $"afx_tachyon_stone_{StoneAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.QuantumStone => $"afx_quantum_stone_{StoneAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.LifeStone => $"afx_life_stone_{StoneAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.ProphecyStone => $"afx_prophecy_stone_{StoneAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.SoulStone => $"afx_soul_stone_{StoneAssetTier(spec)}.png",
+        ArtifactSpec.Types.Name.ClarityStone => $"afx_clarity_stone_{StoneAssetTier(spec)}.png",
         _ => null
     };
 
     return file is null
         ? null
-        : $"https://egg-inc.fandom.com/wiki/Special:FilePath/{Uri.EscapeDataString(file)}";
+        : $"https://eggincassets.pages.dev/64/egginc/{file}";
 }
+
+static int ArtifactAssetTier(ArtifactSpec spec) => (int)spec.Level + 1;
+
+static int StoneAssetTier(ArtifactSpec spec) => spec.Level switch {
+    ArtifactSpec.Types.Level.Inferior => 2,
+    ArtifactSpec.Types.Level.Lesser => 3,
+    ArtifactSpec.Types.Level.Normal => 4,
+    _ => 2
+};
 
 static string GetString(SocketSlashCommand command, string name) =>
     (string)command.Data.Options.First(o => o.Name == name).Value;
@@ -2299,18 +2633,6 @@ static string FormatEggs(double amount) {
 }
 
 static string EggNameForStatsIndex(int index) {
-    var seasonalName = index switch {
-        20 => "Chocolate",
-        21 => "Easter",
-        22 => "Water Balloon",
-        23 => "Firework",
-        24 => "Pumpkin",
-        _ => null
-    };
-    if(seasonalName is not null) {
-        return seasonalName;
-    }
-
     string[] names = [
         "Edible",
         "Superfood",
@@ -2332,8 +2654,23 @@ static string EggNameForStatsIndex(int index) {
         "Universe",
         "Enlightenment"
     ];
+    if(index >= 0 && index < names.Length) {
+        return names[index];
+    }
 
-    return index >= 0 && index < names.Length ? names[index] : $"Egg #{index + 1}";
+    var colleggtibleName = index switch {
+        20 => "Curiosity",
+        21 => "Integrity",
+        22 => "Humility",
+        23 => "Resilience",
+        24 => "Kindness",
+        _ => null
+    };
+    if(colleggtibleName is not null) {
+        return colleggtibleName;
+    }
+
+    return $"Egg #{index + 1}";
 }
 
 static string EggDisplayName(Egg egg) => egg switch {
@@ -2419,7 +2756,8 @@ public sealed record ArtifactCandidate(
     ArtifactPurpose Purpose,
     double Score,
     string Reason,
-    string? ImageUrl);
+    string? ImageUrl,
+    double Multiplier);
 public sealed record WikiAnswer(string Title, string Url, string Answer);
 public sealed record PersonalHelpAnswer(string Title, string Answer, string Source, string? ImageUrl);
 public sealed record FarmerRankInfo(int Oom, string Name);
@@ -2438,6 +2776,7 @@ public sealed record AutoDemeritCandidate(ulong DiscordUserId, string ContractId
 public sealed record MissingJoinAccountSnapshot(RegisteredEggAccount Account, IReadOnlySet<string> JoinedContractIds);
 public sealed record MissingJoinMember(ulong DiscordUserId, string Label, IReadOnlyList<RegisteredEggAccount> Accounts);
 public sealed record MissingJoinAlert(string Key, DateTimeOffset PostedAt);
+public sealed record EggsLaidTotal(string Name, double Amount);
 public sealed record BeerStats(
     ulong GuildId,
     ulong DiscordUserId,
@@ -2480,7 +2819,8 @@ public enum ArtifactPurpose {
     Capacity = 3,
     TeamEarnings = 4,
     Boosting = 5,
-    StoneCarrier = 6
+    InternalHatchery = 6,
+    StoneCarrier = 7
 }
 
 public sealed class EggWikiClient {
