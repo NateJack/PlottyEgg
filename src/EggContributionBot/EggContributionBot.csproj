@@ -23,5 +23,6 @@
   <ItemGroup>
     <None Include="appsettings.example.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="appsettings.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('appsettings.json')" />
+    <None Include="eiafx-data.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

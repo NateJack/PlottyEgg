@@ -13,10 +13,13 @@ The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 ### Player Commands
 
 - `/register-eid` privately registers one or more Egg Inc EIDs to a Discord user.
+- Successful registrations post a name-only random welcome in `plotty-gossip`.
+- `/contract-late-notify` privately flags that the user will be late joining a contract and keeps them off the 6-hour non-join alert while active.
 - `/rates` privately shows the user's running contracts and last 2 completed contracts.
 - `/player` shows recent contribution history, registration date, and a refresh button.
 - `/eggs-laid` privately shows lifetime eggs laid by farm.
 - `/contract-artifacts` privately analyzes artifact inventory and suggests a contract artifact set with artifact image links.
+- `/ships` privately shows active ship mission data and can DM the user when a ship returns.
 - `/help` answers Egg Inc questions from the Egg Inc Wiki and can use registered backup data for personal questions.
 
 ### Contract And Staff Commands
@@ -24,11 +27,15 @@ The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 - `/contract` looks up a specific contract/co-op contribution report.
 - `/admin-rates-all` shows registered players grouped by contract from lowest to highest contribution.
 - `/admin-dashboard` shows staff overview data for registered players, low rates, sync issues, and likely unboosted players.
-- `/admin-demerit` adds, removes, or lists demerits. Demerits expire after 30 days.
+- `/admin-remove-late-notify` lets staff remove a member's active late notice for one contract or all contracts.
+- `/add-demerit` lets staff select a member and add active demerits.
+- `/remove-demerit` lets staff select a member and remove active demerits.
+- `/demerits-view` lets a member privately view their active demerits.
+- `/admin-demerits-view-all` lets staff privately view every member with active demerits.
 - `/admin-plotty-speak` lets staff send a message as Plotty.
 - 6 hours after a contract starts, Plotty automatically posts a Staff-thread alert listing registered members who have not joined the contract yet.
 
-Admin commands can only be run by members with the `Staff` role and must be used in the `Staff` channel.
+Admin commands can be run in any channel, but only members with the `Staff` role can use them.
 
 ### Community Commands
 
@@ -42,9 +49,11 @@ Admin commands can only be run by members with the `Staff` role and must be used
 ### Passive Chat Behavior
 
 - Plotty replies when mentioned.
-- If Plotty is asked a question by mention, it diverts to a random unrelated topic.
+- If Plotty is asked a question by mention, it answers directly when possible; otherwise it gives a general answer and asks a follow-up question.
 - Plotty watches for `what the fox` and responds with a fox-themed reply.
 - Plotty watches for likely sarcastic remarks and responds.
+- Plotty keeps lightweight local personality memory from interactions, storing counters and timestamps only, then uses familiarity to vary future social replies.
+- Plotty composes a fresh first-person side note for every personality interaction using rotating voice fragments.
 
 ## Local Setup
 
