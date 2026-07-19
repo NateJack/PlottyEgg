@@ -13,8 +13,9 @@ The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 ### Player Commands
 
 - `/register-eid` privately registers one or more Egg Inc EIDs to a Discord user.
-- Successful registrations post a name-only random welcome in `plotty-gossip`.
+- Successful registrations post a name-only random welcome in `plotty-questions`.
 - `/contract-late-notify` privately flags that the user will be late joining a contract and keeps them off the 6-hour non-join alert while active.
+- Posting in `#i-am-late-today` also marks the user late for 48 hours, the same as `/contract-late-notify`.
 - `/rates` privately shows the user's running contracts and last 2 completed contracts.
 - `/player` shows recent contribution history, registration date, and a refresh button.
 - `/eggs-laid` privately shows lifetime eggs laid by farm.
@@ -27,6 +28,7 @@ The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 - `/contract` looks up a specific contract/co-op contribution report.
 - `/admin-rates-all` shows registered players grouped by contract from lowest to highest contribution.
 - `/admin-dashboard` shows staff overview data for registered players, low rates, sync issues, and likely unboosted players.
+- `/admin-health` privately shows Staff the last successful/failing check-ins for Plotty's background monitors.
 - `/admin-remove-late-notify` lets staff remove a member's active late notice for one contract or all contracts.
 - `/add-demerit` lets staff select a member and add active demerits.
 - `/remove-demerit` lets staff select a member and remove active demerits.
@@ -70,7 +72,14 @@ Copy-Item src\EggContributionBot\appsettings.example.json src\EggContributionBot
 {
   "Discord": {
     "Token": "paste-bot-token-here",
-    "GuildId": "your-discord-server-id"
+    "GuildId": "your-primary-discord-server-id",
+    "GuildIds": [
+      "your-primary-discord-server-id",
+      "another-discord-server-id"
+    ],
+    "AdminUserIds": [
+      "trusted-discord-user-id"
+    ]
   },
   "Storage": {
     "DataPath": "data/egg-links.json",
@@ -85,6 +94,14 @@ Never commit `appsettings.json`, `data/`, logs, or build output. They are ignore
 
 ```powershell
 dotnet build EggContributionBot.sln
+```
+
+## Tests
+
+The repo includes a small no-dependency console test project for core bot logic:
+
+```powershell
+dotnet run --project tests\EggContributionBot.Tests\EggContributionBot.Tests.csproj
 ```
 
 ## Run Locally
@@ -118,10 +135,23 @@ The bot needs permissions for slash commands, reading messages, sending messages
 ```text
 EggContributionBot.sln
 src/EggContributionBot/
+  Config/
+    BotSettings.cs
+  Data/
+    Egg9000ArtifactData.cs
+  Models/
+    BotModels.cs
+  Services/
+    DataStore.cs
+    EggWikiClient.cs
+    MonitorHealthService.cs
+    PlottyPersonality.cs
   EggIncClient.cs
   Program.cs
   SecureText.cs
   Proto/coopstatus.proto
+tests/EggContributionBot.Tests/
+  Program.cs
 ```
 
-`EGG9000-master/` and `ImportedBot/` are local reference/import folders and are ignored by the repo.
+`Program.cs` owns Discord startup and command handlers. Models, config, storage, personality, wiki, artifact data, and monitor health are split into dedicated files so new features can be tested and reviewed in smaller pieces.

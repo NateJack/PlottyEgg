@@ -9,6 +9,7 @@ using EggContribBot;
 using EggContribBot.Proto;
 
 var settings = BotSettings.Load();
+var plottyAdminUserIds = settings.Discord.ParsedAdminUserIds.ToHashSet();
 var token = settings.Discord.Token
     ?? Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN")
     ?? throw new InvalidOperationException("Set Discord:Token in appsettings.json or DISCORD_BOT_TOKEN.");
@@ -17,8 +18,9 @@ var secureText = new SecureText(settings.Storage.KeyPath);
 var dataStore = new DataStore(settings.Storage.DataPath, secureText);
 var eggClient = new EggIncClient();
 var wikiClient = new EggWikiClient();
-var missingJoinMonitorStarted = false;
-var shipReturnMonitorStarted = false;
+var monitorHealth = new MonitorHealthService();
+var missingJoinMonitorsStarted = new HashSet<ulong>();
+var shipReturnMonitorsStarted = new HashSet<ulong>();
 
 var client = new DiscordSocketClient(new DiscordSocketConfig {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMembers | GatewayIntents.GuildMessages | GatewayIntents.MessageContent,
@@ -32,23 +34,24 @@ client.Log += msg => {
 
 client.Ready += async () => {
     var commands = BuildCommands().Select(c => c.Build()).ToArray();
-    if(settings.Discord.ParsedGuildId is { } guildId) {
-        var guild = client.GetGuild(guildId);
-        if(guild is null) {
-            Console.WriteLine($"Plotty is connected, but guild {guildId} was not found. Is Plotty invited?");
-            return;
-        }
-
+    var guildIds = settings.Discord.ParsedGuildIds.Distinct().ToArray();
+    if(guildIds.Length > 0) {
         await client.Rest.BulkOverwriteGlobalCommands([]);
-        await guild.BulkOverwriteApplicationCommandAsync(commands);
-        Console.WriteLine($"Logged in as {client.CurrentUser}; registered {commands.Length} commands in {guild.Name}.");
-        if(!missingJoinMonitorStarted) {
-            missingJoinMonitorStarted = true;
-            _ = Task.Run(() => MonitorMissingCoopJoinsAsync(guildId));
-        }
-        if(!shipReturnMonitorStarted) {
-            shipReturnMonitorStarted = true;
-            _ = Task.Run(() => MonitorShipReturnsAsync(guildId));
+        foreach(var guildId in guildIds) {
+            var guild = client.GetGuild(guildId);
+            if(guild is null) {
+                Console.WriteLine($"Plotty is connected, but guild {guildId} was not found. Is Plotty invited?");
+                continue;
+            }
+
+            await guild.BulkOverwriteApplicationCommandAsync(commands);
+            Console.WriteLine($"Logged in as {client.CurrentUser}; registered {commands.Length} commands in {guild.Name}.");
+            if(missingJoinMonitorsStarted.Add(guildId)) {
+                _ = Task.Run(() => MonitorMissingCoopJoinsAsync(guildId));
+            }
+            if(shipReturnMonitorsStarted.Add(guildId)) {
+                _ = Task.Run(() => MonitorShipReturnsAsync(guildId));
+            }
         }
     } else {
         await client.Rest.BulkOverwriteGlobalCommands(commands);
@@ -84,6 +87,9 @@ client.SlashCommandExecuted += async command => {
                 break;
             case "admin-dashboard":
                 await HandleDashboardAsync(command);
+                break;
+            case "admin-health":
+                await HandleAdminHealthAsync(command);
                 break;
             case "add-demerit":
                 await HandleAddDemeritAsync(command);
@@ -214,6 +220,11 @@ client.MessageReceived += async message => {
             return;
         }
 
+        if(IsLateTodayChannel(guildChannel) && message.Author is SocketGuildUser lateUser) {
+            await HandleLateTodayMessageAsync(message, lateUser, guildChannel.Guild);
+            return;
+        }
+
         if(message.MentionedUsers.Any(u => u.Id == client.CurrentUser.Id)) {
             var prompt = StripBotMention(message.Content);
             var isQuestion = LooksLikeQuestion(prompt);
@@ -286,6 +297,10 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
     yield return new SlashCommandBuilder()
         .WithName("admin-dashboard")
         .WithDescription("Show a staff overview of registered players, low rates, sync issues, and likely unboosted players.");
+
+    yield return new SlashCommandBuilder()
+        .WithName("admin-health")
+        .WithDescription("Staff only: show Plotty background monitor health.");
 
     yield return new SlashCommandBuilder()
         .WithName("add-demerit")
@@ -393,22 +408,53 @@ async Task HandleContractLateNotifyAsync(SocketSlashCommand command) {
         note = note[..300];
     }
 
-    var notice = await dataStore.RecordContractLateNoticeAsync(
+    var (notice, staffChannel) = await RecordAndPostContractLateNoticeAsync(
         command.GuildId!.Value,
-        user.Id,
+        user,
         string.IsNullOrWhiteSpace(contractId) ? null : contractId,
         string.IsNullOrWhiteSpace(eta) ? null : eta,
         string.IsNullOrWhiteSpace(note) ? null : note);
+    var contractText = string.IsNullOrWhiteSpace(notice.ContractId) ? "current contracts" : $"`{notice.ContractId}`";
+    var staffText = staffChannel is null ? " I could not find a Staff notice channel, but I saved the flag locally." : " I let Staff know without pinging them.";
+    await command.RespondAsync($"Got it. I marked you late for {contractText} for the next 48 hours, so you will not be added to the 6-hour non-join list while that flag is active.{staffText}", ephemeral: true);
+}
 
-    var guild = client.GetGuild(command.GuildId.Value);
+async Task HandleLateTodayMessageAsync(SocketMessage message, SocketGuildUser user, SocketGuild guild) {
+    var contractId = ExtractLateNoticeContractId(message.Content);
+    var note = TrimDiscordMessage(Regex.Replace(message.Content, @"\s+", " ").Trim(), 300);
+    var (notice, _) = await RecordAndPostContractLateNoticeAsync(
+        guild.Id,
+        user,
+        contractId,
+        eta: "late today",
+        note: string.IsNullOrWhiteSpace(note) ? null : note);
+    var contractText = string.IsNullOrWhiteSpace(notice.ContractId) ? "current contracts" : $"`{notice.ContractId}`";
+    await message.AddReactionAsync(new Emoji("✅"));
+    await message.Channel.SendMessageAsync(
+        $"{user.Mention} got it. I marked you late for {contractText} for the next 48 hours.",
+        allowedMentions: AllowedMentions.None);
+}
+
+async Task<(ContractLateNotice Notice, SocketTextChannel? StaffChannel)> RecordAndPostContractLateNoticeAsync(
+    ulong guildId,
+    SocketGuildUser user,
+    string? contractId,
+    string? eta,
+    string? note) {
+    var notice = await dataStore.RecordContractLateNoticeAsync(
+        guildId,
+        user.Id,
+        contractId,
+        eta,
+        note);
+
+    var guild = client.GetGuild(guildId);
     var staffChannel = guild is null ? null : FindStaffNoticeChannel(guild);
     if(staffChannel is not null) {
         await staffChannel.SendMessageAsync(embed: BuildContractLateNoticeEmbed(user, notice), allowedMentions: AllowedMentions.None);
     }
 
-    var contractText = string.IsNullOrWhiteSpace(notice.ContractId) ? "current contracts" : $"`{notice.ContractId}`";
-    var staffText = staffChannel is null ? " I could not find a Staff notice channel, but I saved the flag locally." : " I let Staff know without pinging them.";
-    await command.RespondAsync($"Got it. I marked you late for {contractText} for the next 48 hours, so you will not be added to the 6-hour non-join list while that flag is active.{staffText}", ephemeral: true);
+    return (notice, staffChannel);
 }
 
 Embed BuildContractLateNoticeEmbed(SocketGuildUser user, ContractLateNotice notice) {
@@ -716,13 +762,53 @@ async Task HandleDashboardButtonAsync(SocketMessageComponent component) {
     }
 }
 
+async Task HandleAdminHealthAsync(SocketSlashCommand command) {
+    var staffUser = command.User as SocketGuildUser;
+    if(staffUser is null || !HasStaffRole(staffUser)) {
+        await command.RespondAsync("Only members with the Staff role can use admin health.", ephemeral: true);
+        return;
+    }
+
+    var snapshots = monitorHealth.GetSnapshots(command.GuildId!.Value);
+    var builder = new EmbedBuilder()
+        .WithTitle("Plotty Monitor Health")
+        .WithColor(snapshots.Any(s => s.FailureCount > 0) ? Color.Orange : Color.Green)
+        .WithCurrentTimestamp();
+
+    if(snapshots.Count == 0) {
+        builder.WithDescription("No monitor check-ins have been recorded yet. Give me a minute after startup.");
+    } else {
+        foreach(var snapshot in snapshots) {
+            var lines = new List<string>();
+            lines.Add(snapshot.LastSuccessAt is null
+                ? "**Last success:** never"
+                : $"**Last success:** <t:{snapshot.LastSuccessAt.Value.ToUnixTimeSeconds()}:R>");
+            if(snapshot.LastFailureAt is not null) {
+                lines.Add($"**Last failure:** <t:{snapshot.LastFailureAt.Value.ToUnixTimeSeconds()}:R>");
+                lines.Add($"**Failures:** {snapshot.FailureCount}");
+                if(!string.IsNullOrWhiteSpace(snapshot.LastError)) {
+                    lines.Add($"**Last error:** {TrimDiscordMessage(snapshot.LastError, 250)}");
+                }
+            } else {
+                lines.Add("**Failures:** 0");
+            }
+
+            builder.AddField(snapshot.Name, string.Join("\n", lines), inline: false);
+        }
+    }
+
+    await command.RespondAsync(embed: builder.Build(), ephemeral: true);
+}
+
 async Task MonitorMissingCoopJoinsAsync(ulong guildId) {
     await Task.Delay(TimeSpan.FromMinutes(2));
     using var timer = new PeriodicTimer(TimeSpan.FromMinutes(30));
     while(true) {
         try {
             await CheckMissingCoopJoinsAsync(guildId);
+            monitorHealth.ReportSuccess("missing-coop-joins", guildId);
         } catch(Exception ex) {
+            monitorHealth.ReportFailure("missing-coop-joins", guildId, ex);
             Console.WriteLine($"Missing coop join monitor failed: {ex}");
         }
 
@@ -736,7 +822,9 @@ async Task MonitorShipReturnsAsync(ulong guildId) {
     while(true) {
         try {
             await CheckShipReturnNotificationsAsync(guildId);
+            monitorHealth.ReportSuccess("ship-returns", guildId);
         } catch(Exception ex) {
+            monitorHealth.ReportFailure("ship-returns", guildId, ex);
             Console.WriteLine($"Ship return monitor failed: {ex}");
         }
 
@@ -910,22 +998,25 @@ async Task PostMissingJoinAlertAsync(SocketTextChannel staffChannel, string cont
 static SocketTextChannel? FindStaffTextChannel(SocketGuild guild) =>
     guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "staff");
 
-static SocketTextChannel? FindPlottyGossipChannel(SocketGuild guild) =>
-    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "plottygossip");
+static SocketTextChannel? FindPlottyQuestionsChannel(SocketGuild guild) =>
+    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "plottyquestions");
+
+static SocketTextChannel? FindModLogChannel(SocketGuild guild) =>
+    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "modlog");
 
 static SocketTextChannel? FindStaffNoticeChannel(SocketGuild guild) =>
-    FindPlottyGossipChannel(guild) ?? FindStaffTextChannel(guild);
+    FindPlottyQuestionsChannel(guild) ?? FindStaffTextChannel(guild);
 
 async Task SendRegistrationWelcomeAsync(ulong guildId, IUser user) {
     var guild = client.GetGuild(guildId);
-    var gossipChannel = guild is null ? null : FindPlottyGossipChannel(guild);
-    if(gossipChannel is null) {
+    var questionsChannel = guild is null ? null : FindPlottyQuestionsChannel(guild);
+    if(questionsChannel is null) {
         return;
     }
 
     var displayName = user is SocketGuildUser guildUser ? guildUser.DisplayName : user.Username;
     var memory = await dataStore.RecordPlottyInteractionAsync(guildId, user.Id, "registration");
-    await gossipChannel.SendMessageAsync(
+    await questionsChannel.SendMessageAsync(
         $"{displayName} {PlottyPersonality.RegistrationWelcome(memory)}",
         allowedMentions: AllowedMentions.None);
 }
@@ -1304,6 +1395,29 @@ async Task HandleAdminPlottySpeakAsync(SocketSlashCommand command) {
 
     await command.RespondAsync("Plotty has spoken.", ephemeral: true);
     await command.Channel.SendMessageAsync(message);
+    await LogPlottySpeakAsync(command, staffUser, message);
+}
+
+async Task LogPlottySpeakAsync(SocketSlashCommand command, SocketGuildUser staffUser, string message) {
+    var guild = client.GetGuild(command.GuildId!.Value);
+    var modLog = guild is null ? null : FindModLogChannel(guild);
+    if(modLog is null) {
+        return;
+    }
+
+    var sourceChannel = command.Channel is SocketGuildChannel channel
+        ? $"<#{channel.Id}>"
+        : command.Channel.Name;
+    var embed = new EmbedBuilder()
+        .WithTitle("Plotty Speak Used")
+        .WithColor(Color.DarkGrey)
+        .AddField("Used by", $"{staffUser.Mention} (`{staffUser.Username}`)", true)
+        .AddField("Channel", sourceChannel, true)
+        .AddField("Message", TrimDiscordMessage(message, 1000))
+        .WithCurrentTimestamp()
+        .Build();
+
+    await modLog.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
 }
 
 async Task HandleHelpAsync(SocketSlashCommand command) {
@@ -1892,23 +2006,12 @@ static string DisplayNameForDemerits(SocketGuild? guild, ulong userId) {
     return user is null ? $"<@{userId}>" : user.Mention;
 }
 
-static bool HasStaffRole(SocketGuildUser user) =>
+bool HasStaffRole(SocketGuildUser user) =>
     IsPlottyAdmin(user) ||
     user.Roles.Any(r => string.Equals(r.Name, "Staff", StringComparison.OrdinalIgnoreCase));
 
-static bool IsPlottyAdmin(SocketGuildUser user) {
-    var names = new[] {
-        user.Username,
-        user.GlobalName,
-        user.DisplayName,
-        user.Nickname
-    };
-
-    return names
-        .Where(n => !string.IsNullOrWhiteSpace(n))
-        .Select(NormalizeName)
-        .Any(n => n is "felixlovestrains" or "chemicaljump");
-}
+bool IsPlottyAdmin(SocketGuildUser user) =>
+    plottyAdminUserIds.Contains(user.Id);
 
 static double Median(IReadOnlyList<double> values) {
     if(values.Count == 0) {
@@ -2912,6 +3015,22 @@ async Task<string> BuildPlottyConversationResponseAsync(
 static string StripBotMention(string content) =>
     Regex.Replace(content, @"<@!?\d+>", "", RegexOptions.Compiled).Trim();
 
+static bool IsLateTodayChannel(SocketGuildChannel channel) =>
+    NormalizeName(channel.Name) == "iamlatetoday";
+
+static string? ExtractLateNoticeContractId(string content) {
+    var contractMatch = Regex.Match(
+        content,
+        @"(?:contract|contract-id|contract id)\s*[:=]?\s*`?(?<id>[a-z0-9][a-z0-9\-]{2,})`?",
+        RegexOptions.IgnoreCase);
+    if(contractMatch.Success) {
+        return contractMatch.Groups["id"].Value;
+    }
+
+    var taggedMatch = Regex.Match(content, @"#(?<id>[a-z0-9][a-z0-9\-]{2,})", RegexOptions.IgnoreCase);
+    return taggedMatch.Success ? taggedMatch.Groups["id"].Value : null;
+}
+
 static bool IsGreeting(string normalized) =>
     Regex.IsMatch(normalized, @"\b(hi|hello|hey|yo|sup|good morning|good evening|good afternoon)\b", RegexOptions.IgnoreCase);
 
@@ -2937,7 +3056,7 @@ static (string Topic, string Answer)? TryAnswerPlottyQuestion(string normalized)
     }
 
     if(normalized.Contains("register") || normalized.Contains("eid")) {
-        return ("EID registration", "Use `/register-eid` to privately register one or more Egg Inc IDs. I store encrypted EIDs locally and only post a name-only welcome in `plotty-gossip`.");
+        return ("EID registration", "Use `/register-eid` to privately register one or more Egg Inc IDs. I store encrypted EIDs locally and only post a name-only welcome in `plotty-questions`.");
     }
 
     if(normalized.Contains("rates")) {
@@ -3145,1473 +3264,3 @@ static string NormalizeName(string? value) {
         .ToArray());
 }
 
-public sealed record BotSettings(DiscordSettings Discord, StorageSettings Storage) {
-    public static BotSettings Load() {
-        const string path = "appsettings.json";
-        if(File.Exists(path)) {
-            var settings = JsonSerializer.Deserialize<BotSettings>(
-                File.ReadAllText(path),
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            if(settings is not null) {
-                return settings;
-            }
-        }
-
-        return new BotSettings(new DiscordSettings(null, null), new StorageSettings("data/egg-links.json", "data/eid-key.bin"));
-    }
-}
-
-public sealed record DiscordSettings(string? Token, string? GuildId) {
-    public ulong? ParsedGuildId => ulong.TryParse(GuildId, out var id) ? id : null;
-}
-
-public sealed record StorageSettings(string DataPath, string KeyPath = "data/eid-key.bin");
-
-public sealed record EggUserLink(ulong GuildId, ulong DiscordUserId, string EggId, string? EggName);
-public sealed record RegisteredEid(ulong GuildId, ulong DiscordUserId, string EidHash, string EncryptedEid, string? EggName, DateTimeOffset UpdatedAt);
-public sealed record RegisteredEggAccount(ulong DiscordUserId, string Eid, string? EggName, DateTimeOffset UpdatedAt) {
-    public string EidHash => SecureText.Sha256(EggIncClient.NormalizeEggId(Eid));
-}
-public sealed record PlayerContractCandidate(string ContractId, string CoopCode, double AcceptedAt);
-public sealed record ContractFarmSnapshot(int Index, Backup.Types.Simulation Farm);
-public sealed record PlayerContractRate(string ContractId, double RatePerHour, double ContributionAmount);
-public sealed record ArtifactCandidate(
-    ArtifactInventoryItem Item,
-    CompleteArtifact Artifact,
-    ArtifactSpec.Types.Name Name,
-    string DisplayName,
-    ArtifactPurpose Purpose,
-    double LayingMultiplier,
-    double ShippingMultiplier,
-    double TeamLayingMultiplier,
-    double DeflectorBonus,
-    string Reason,
-    string? ImageUrl,
-    IReadOnlyList<ArtifactSpec> Stones,
-    int SlotCount,
-    bool StonesChanged);
-public sealed record StoneOption(ArtifactSpec Spec, string DisplayName, double Delta, string? ImageUrl);
-public sealed record ArtifactSetSuggestion(string Label, IReadOnlyList<ArtifactCandidate> Set, double Score);
-public sealed record WikiAnswer(string Title, string Url, string Answer);
-public sealed record PersonalHelpAnswer(string Title, string Answer, string Source, string? ImageUrl);
-public sealed record FarmerRankInfo(int Oom, string Name);
-public sealed record DashboardResult(string Message, IReadOnlyList<Embed> Embeds, IReadOnlyList<DashboardPlayerRow> Rows);
-public sealed record DashboardPlayerRow(
-    string ContractId,
-    ulong DiscordUserId,
-    string PlayerName,
-    double RatePerHour,
-    double ContributionAmount,
-    bool Active,
-    bool TimeCheatDetected,
-    DashboardCategory Category,
-    string Reason);
-public sealed record AutoDemeritCandidate(ulong DiscordUserId, string ContractId, double RatePerHour, string PlayerName, string SourceKey);
-public sealed record MissingJoinAccountSnapshot(RegisteredEggAccount Account, IReadOnlySet<string> JoinedContractIds);
-public sealed record MissingJoinMember(ulong DiscordUserId, string Label, IReadOnlyList<RegisteredEggAccount> Accounts);
-public sealed record MissingJoinAlert(string Key, DateTimeOffset PostedAt);
-public sealed record ContractLateNotice(
-    ulong GuildId,
-    ulong DiscordUserId,
-    string? ContractId,
-    string? Eta,
-    string? Note,
-    DateTimeOffset CreatedAt,
-    DateTimeOffset ExpiresAt);
-public sealed record ShipMissionSnapshot(
-    MissionInfo Mission,
-    string Key,
-    string ShipName,
-    string StatusName,
-    string DurationTypeName,
-    string MissionTypeName,
-    DateTimeOffset? StartedAt,
-    DateTimeOffset? ReturnAt);
-public sealed record ShipReturnNotification(
-    ulong GuildId,
-    ulong DiscordUserId,
-    string EidHash,
-    string MissionKey,
-    string ShipName,
-    DateTimeOffset ReturnAt,
-    DateTimeOffset CreatedAt,
-    DateTimeOffset? NotifiedAt) {
-    public string Key => $"{GuildId}:{DiscordUserId}:{EidHash}:{MissionKey}";
-}
-public sealed record EggsLaidTotal(string Name, double Amount);
-public sealed record BeerStats(
-    ulong GuildId,
-    ulong DiscordUserId,
-    int BeersGivenToBot,
-    int BeersBoughtByBot,
-    DateTimeOffset FirstBeerAt,
-    DateTimeOffset LastBeerAt,
-    DateTimeOffset? LastBotBeerAt,
-    int BeersReceivedFromMembers = 0,
-    int BeersGivenToMembers = 0,
-    DateTimeOffset? LastMemberBeerReceivedAt = null,
-    DateTimeOffset? LastMemberBeerGivenAt = null);
-public sealed record BeerAttemptResult(bool Accepted, BeerStats Stats, TimeSpan? RetryAfter);
-public sealed record BeerGiftLog(ulong GuildId, ulong GiverDiscordUserId, ulong RecipientDiscordUserId, DateTimeOffset GiftedAt);
-public sealed record PlottyMemory(
-    ulong GuildId,
-    ulong DiscordUserId,
-    int TotalInteractions,
-    int Mentions,
-    int QuestionsDodged,
-    int SarcasmDetected,
-    int FoxMoments,
-    int Beers,
-    int Registrations,
-    int MoodChecks,
-    int Excuses,
-    int WisdomRequests,
-    DateTimeOffset FirstSeenAt,
-    DateTimeOffset LastSeenAt);
-public sealed record PlottyConversationState(
-    ulong GuildId,
-    ulong DiscordUserId,
-    string LastTopic,
-    int Turns,
-    DateTimeOffset FirstSeenAt,
-    DateTimeOffset LastSeenAt);
-public sealed record DemeritEntry(
-    string Id,
-    ulong GuildId,
-    ulong DiscordUserId,
-    int Amount,
-    string Reason,
-    string? ContractId,
-    string? PlayerName,
-    string? SourceKey,
-    DateTimeOffset CreatedAt,
-    DateTimeOffset ExpiresAt,
-    DateTimeOffset? RemovedAt);
-
-public enum DashboardCategory {
-    NoSync = 0,
-    LikelyUnboosted = 1,
-    BelowThreshold = 2,
-    Flagged = 3,
-    Healthy = 4
-}
-
-public enum ArtifactPurpose {
-    TeamLaying = 0,
-    Laying = 1,
-    Shipping = 2,
-    Capacity = 3,
-    TeamEarnings = 4,
-    Boosting = 5,
-    InternalHatchery = 6,
-    StoneCarrier = 7
-}
-
-public static class PlottyPersonality {
-    private static readonly string[] MentionReplies = [
-        "Plotty has been summoned and is pretending to look busy.",
-        "Plotty is here, carrying one clipboard and absolutely no certainty.",
-        "Plotty heard its name and arrived with suspicious confidence.",
-        "Plotty acknowledges the ping and offers one respectful nod.",
-        "Plotty is present, lightly caffeinated, and monitoring the egg economy.",
-        "Plotty has entered the chat with premium-grade confusion.",
-        "Plotty is listening. Plotty is also thinking about snacks.",
-        "Plotty reports for duty, probably.",
-        "Plotty appears with a clipboard and no promise that the clipboard helps.",
-        "Plotty has arrived wearing the emotional equivalent of a tiny vest.",
-        "Plotty heard the ping and immediately looked important.",
-        "Plotty is here, and the ledger is pretending this was scheduled.",
-        "Plotty accepts the summons with medium confidence and high posture.",
-        "Plotty has stepped out from behind the spreadsheet curtain.",
-        "Plotty is awake, mostly, which counts under guild policy.",
-        "Plotty heard its name and brought backup stationery.",
-        "Plotty has entered with the calm of a bot that did not read the room.",
-        "Plotty is present and willing to blame latency if needed.",
-        "Plotty has been perceived. The paperwork begins.",
-        "Plotty is here, carrying vibes, charts, and one questionable assumption.",
-        "Plotty responds from the administrative nest.",
-        "Plotty has joined the conversation and is standing near the snacks.",
-        "Plotty acknowledges this ping with theatrical seriousness.",
-        "Plotty arrives at a brisk ledger-approved pace.",
-        "Plotty is listening with both pixels.",
-        "Plotty heard the call and dusted off the response lever.",
-        "Plotty is here to help, hover, or make it weirder.",
-        "Plotty has surfaced from the data pond with a tiny nod."
-    ];
-
-    private static readonly string[] QuestionDiversions = [
-        "I can answer if I have enough context. Give me the contract, command, player detail, or Egg Inc term you mean.",
-        "I want to answer that directly. Add one more detail so I do not guess wrong.",
-        "I am listening. If this is about Egg Inc, name the mechanic or contract and I will use what I know.",
-        "I can work with that, but I need a sharper target before I give an answer.",
-        "I do not want to dodge it. Give me the missing piece and I will take a real swing.",
-        "I need a little more context to answer cleanly. What part should I focus on?",
-        "I can help with that if you point me at the command, player, contract, or artifact.",
-        "I am not sure which part you mean yet. Ask it one level more specifically and I will answer."
-    ];
-
-    private static readonly (string Emoji, string Story)[] Moods = [
-        ("\U0001F305\U0001F95A\U0001F4C8\u2615\U0001F914\U0001F414\U0001F483\U0001F37A\U0001F319",
-            "Plotty woke up optimistic, checked the numbers, overthought one chicken, danced anyway, accepted a beer, and called it a productive day."),
-        ("\u23F0\U0001F95A\U0001F4BB\U0001F525\U0001F9EF\U0001F60C\U0001F4CA\U0001F3C6",
-            "Plotty started early, found an egg-shaped emergency in the logs, calmly put out the fire, and somehow ended with a victory chart."),
-        ("\U0001F414\U0001F6AA\U0001F95A\U0001F95A\U0001F95A\U0001F633\U0001F4C9\U0001F37A\U0001F64F",
-            "A chicken opened the wrong door, three eggs fell out, the rates dipped, and Plotty requested one respectful recovery beverage."),
-        ("\U0001F327\uFE0F\U0001F95A\U0001F6E0\uFE0F\u2699\uFE0F\u2728\U0001F4C8\U0001F60E\U0001F324\uFE0F",
-            "The morning was stormy, but Plotty fixed the egg machinery, polished the gears, watched the line go up, and put on sunglasses indoors."),
-        ("\U0001F4E6\U0001F95A\U0001F4E6\U0001F95A\U0001F4E6\U0001F605\u2705",
-            "Plotty sorted boxes, found eggs in every box, sweated a little, and still marked the task complete."),
-        ("\U0001F95A\U0001F4DD\U0001F914\U0001F37A\U0001F4C8\U0001F389",
-            "Plotty wrote one serious note, questioned the note, accepted a beer, watched the graph rise, and celebrated like this was planned."),
-        ("\U0001F414\U0001F4E3\U0001F4CA\U0001F62C\U0001F6E0\U0001F31F",
-            "A chicken announced a chart problem, Plotty panicked politely, fixed a tiny gear, and pretended the sparkle was intentional."),
-        ("\U0001F319\U0001F95A\U0001F50D\U0001F4DA\U0001F634",
-            "Plotty stayed up late, inspected one mysterious egg, read too much documentation, and fell asleep on the findings."),
-        ("\u2615\U0001F95A\U0001F680\U0001F4C8\U0001F973",
-            "Plotty drank coffee, launched an egg-shaped plan, watched the numbers behave, and got too excited about it."),
-        ("\U0001F9EE\U0001F414\U0001F37A\U0001F4CB\u2705",
-            "Plotty did math with a chicken consultant, paid the consultant in imaginary beer, and checked the box.")
-    ];
-
-    private static readonly string[] Excuses = [
-        "Plotty cannot reply right now because a chicken is sitting on the enter key.",
-        "Plotty is busy explaining compound interest to an egg that refuses to hatch.",
-        "Plotty has been summoned to a very important coop meeting about snacks.",
-        "Plotty's response is incubating. Please allow three to five business clucks.",
-        "Plotty tried to answer, but the egg rolled under the server rack.",
-        "Plotty is currently negotiating with a hen who demands better token timing.",
-        "Plotty's thoughts are scrambled, lightly salted, and served with toast.",
-        "Plotty is waiting for the game servers to sync, which may outlive us all.",
-        "Plotty cannot reply until the coop morale committee approves the vibes.",
-        "Plotty found an eggcellent answer, then immediately misplaced it in the nest.",
-        "Plotty is alphabetizing yolks for regulatory reasons.",
-        "Plotty is stuck in a meeting titled `Why Is The Button Like That`.",
-        "Plotty dropped the reply into a silo and now needs a ladder.",
-        "Plotty is recalibrating its dramatic pause module.",
-        "Plotty is currently asking a spreadsheet to be brave.",
-        "Plotty has to reboot one tiny opinion before continuing.",
-        "Plotty is polishing the coop ledger until it reflects better choices.",
-        "Plotty cannot reply because the answer is wearing a fake mustache.",
-        "Plotty is chasing a decimal point that escaped containment.",
-        "Plotty is taking inventory of imaginary clipboards.",
-        "Plotty was ready, but the response got distracted by a progress bar.",
-        "Plotty is negotiating with a graph that refuses to go up.",
-        "Plotty has entered silent mode, which is odd because it is still talking.",
-        "Plotty is checking whether the reply has enough structural integrity.",
-        "Plotty cannot reply until this egg finishes its character arc."
-    ];
-
-    private static readonly string[] WisdomLines = [
-        "The egg does not rush the dawn, and somehow breakfast still happens.",
-        "A full coop is useful, but a synced coop is sacred.",
-        "Do not measure the day only by eggs laid. Measure it by the chaos you survived with style.",
-        "The chicken that crosses the road still has to sync when it gets there.",
-        "Greatness is often just consistency wearing a little hat.",
-        "One good prestige can forgive many confused mornings.",
-        "Be kind to your future self; they inherit every choice you are too tired to label.",
-        "If the numbers look bad, first check the sync. If the sync looks bad, check your patience.",
-        "The leaderboard remembers the rate, but the guild remembers who showed up.",
-        "The best time to sync was earlier. The second best time is before Staff notices.",
-        "A good plan is just panic with a calendar.",
-        "The farm grows when the small boring things keep happening.",
-        "Every great chart began as one number refusing to stay lonely.",
-        "Do not fear the dip; fear the unexamined dip.",
-        "A calm player checks sync before inventing a conspiracy.",
-        "Some doors open because you pushed. Some open because you finally updated.",
-        "A full hab is not a personality, but it does help.",
-        "The patient farmer gets data. The impatient farmer gets screenshots.",
-        "If morale is low, add clarity, not noise.",
-        "A rate is a promise the server has agreed to remember.",
-        "The smallest useful habit beats the grandest abandoned plan.",
-        "Do not let a bad graph narrate your entire day.",
-        "A contract is temporary, but the screenshot can become folklore.",
-        "Strong coops are built from people who sync before being asked twice.",
-        "Wisdom is knowing when to prestige and when to drink water.",
-        "If the egg will not hatch, give it time and maybe fewer meetings.",
-        "Even the golden egg started as a suspicious oval.",
-        "The best artifact is the one you remembered to equip.",
-        "A player who asks early saves Staff from dramatic punctuation.",
-        "Every ledger has room for one more honest improvement."
-    ];
-
-    private static readonly string[] BeerThanks = [
-        "slides the beer into a tiny server rack koozie. Thank you.",
-        "accepts the beer with all the grace of a spreadsheet learning to dance.",
-        "raises a glass and immediately starts optimizing the foam-to-liquid ratio.",
-        "thanks you warmly, then files the receipt under `important nonsense`.",
-        "takes a sip and briefly understands human morale.",
-        "clinks glasses. A small background process is now happier.",
-        "adds `beer` to the dependency graph. Build morale succeeded.",
-        "nods solemnly. The hops have been acknowledged.",
-        "accepts the offering. The command cooldown gods are pleased.",
-        "logs this as a critical uptime improvement.",
-        "toasts to clean syncs, high rates, and suspiciously cooperative APIs.",
-        "drinks responsibly, which for Plotty means staying under the token limit.",
-        "accepts the beer and promises not to deploy after the second one.",
-        "raises the glass like it just passed CI on the first try.",
-        "salutes you with a frosty beverage and questionable dignity.",
-        "logs the beer as morale infrastructure.",
-        "places the beer beside the sacred clipboard.",
-        "thanks you and upgrades one tiny background process to cheerful.",
-        "accepts the beer with a nod normally reserved for clean data.",
-        "files this under `community support, liquid edition`.",
-        "adds foam to the dashboard because metrics deserve texture.",
-        "thanks you. The pub ledger purrs softly.",
-        "sets the beer down exactly 2 pixels from the database.",
-        "accepts the pint and briefly forgives all latency.",
-        "declares this beverage operationally significant.",
-        "raises a glass to syncs that happen before anyone panics.",
-        "marks this as a successful human-bot cultural exchange.",
-        "accepts the beer and becomes 4% more conversational.",
-        "thanks you while pretending not to check the leaderboard.",
-        "places a coaster under the beer and calls it governance."
-    ];
-
-    private static readonly string[] BeerGifts = [
-        "Plot twist: Plotty bought **you** a beer. Legendary hydration event.",
-        "Plotty checked the tab and decided this round is on the house.",
-        "Critical success. Plotty buys you a beer and pretends this was budgeted.",
-        "Plotty reaches into an imaginary wallet and buys you a cold one.",
-        "Reverse uno: Plotty buys you a beer. Your leaderboard era begins.",
-        "Plotty says thank you by buying you a beer and absolutely calling it strategy.",
-        "A rare kindness proc occurred. Plotty bought you a beer.",
-        "Plotty has selected you for the sacred beverage reimbursement program.",
-        "Plotty buys the round. Please enjoy this highly responsible victory.",
-        "Against all accounting advice, Plotty bought you a beer.",
-        "Plotty looked at the tab, looked at destiny, and bought you a beer.",
-        "Plotty has issued one cold beverage from the emergency morale fund.",
-        "Plotty bought you a beer and is now standing like this was heroic.",
-        "The pub algorithm smiled. Plotty bought you a beer.",
-        "Plotty returns the favor with a beverage and suspicious ceremony.",
-        "Plotty bought the round and quietly updated the legend column.",
-        "Plotty has chosen generosity, which is cheaper than therapy.",
-        "Plotty bought you a beer. The ledger blushed.",
-        "Plotty declares you hydrated by administrative decree.",
-        "A frosty reward has emerged from the Plotty budget fog."
-    ];
-
-    private static readonly string[] RegistrationWelcomes = [
-        "has entered the coop ledger. Plotty tips the tiny hat.",
-        "is officially on the books. Welcome to the nest.",
-        "just registered. The paperwork has been pecked into place.",
-        "has joined the registry. Plotty approves this administrative egg.",
-        "is now known to Plotty. May the rates be mighty.",
-        "has been added to the roll call. Welcome aboard.",
-        "just checked in. The guild clipboard is pleased.",
-        "is registered and ready for contract glory.",
-        "has arrived in the registry. Plotty made room at the counter.",
-        "is now in the system. The spreadsheet quietly celebrates.",
-        "has joined the roster. Plotty dusted off a tiny welcome mat.",
-        "is officially indexed. The coop ledger nods respectfully.",
-        "has been entered into Plotty's very serious list of people.",
-        "just made the registry more powerful by one name.",
-        "has arrived. Plotty updated the imaginary seating chart.",
-        "is now registered. The clipboard has stopped tapping its foot.",
-        "has joined the data nest. Welcome to the organized chaos.",
-        "is on the books. Plotty promises not to make this too formal.",
-        "has registered. The guild paperwork did a tiny backflip.",
-        "is now known to the ledger, and the ledger is being cool about it.",
-        "has stepped into the registry with excellent timing.",
-        "is registered. Plotty lit the ceremonial desk lamp.",
-        "has joined the record. The coop vibes improved slightly.",
-        "is in the system now. Plotty will try to act normal.",
-        "has been welcomed by the ledger goblet of responsibility."
-    ];
-
-    private static readonly string[] SarcasmReplies = [
-        "Plotty detected sarcasm and has filed it under `emotionally seasoned feedback`.",
-        "Plotty hears the sarcasm. Plotty is placing a tiny cone around it for safety.",
-        "Plotty has identified a sarcastic remark with approximately 87% poultry confidence.",
-        "Plotty caught that tone. The coop drama sensors are blinking.",
-        "Plotty has translated that as: `everything is fine, except the part where it is not`.",
-        "Plotty appreciates the artisanal sarcasm. Very small batch. Very crispy.",
-        "Plotty recognizes this flavor: lightly toasted sarcasm with notes of chaos.",
-        "Plotty recommends pairing that sarcasm with a responsible sync and a glass of water.",
-        "Plotty detected tone with garnish.",
-        "Plotty is placing that remark in the velvet-lined sarcasm drawer.",
-        "Plotty heard the italics even though none were typed.",
-        "Plotty has logged this as premium dry seasoning.",
-        "Plotty is not judging, but the chart just raised an eyebrow.",
-        "Plotty awards one invisible ribbon for controlled bitterness.",
-        "Plotty has marked the air as `lightly spicy`.",
-        "Plotty translated that into spreadsheet sighs.",
-        "Plotty caught the tone before it escaped into general chat.",
-        "Plotty is serving that sarcasm with a side of plausible deniability.",
-        "Plotty salutes the remark and its emotional support quotation marks.",
-        "Plotty has detected a fine mist of `sure, totally`.",
-        "Plotty recognizes the rare double-yolk sarcasm formation.",
-        "Plotty is forwarding this to the Department of Obviously Fine Situations.",
-        "Plotty notes the sarcasm and gently labels the container."
-    ];
-
-    private static readonly string[] FoxReplies = [
-        "Plotty heard the fox inquiry and has opened a very serious woodland investigation.",
-        "Plotty refuses to speculate without a tiny detective hat and at least three snacks.",
-        "Plotty checked the logs. The fox remains mysterious, dramatic, and weirdly catchy.",
-        "Plotty translated the fox report: mostly vibes, zero actionable metrics.",
-        "Plotty thinks the fox answer is above its current permission level.",
-        "Plotty advises calm. The fox is probably just optimizing its contribution rate.",
-        "Plotty says: if the fox syncs late, Staff will hear about it.",
-        "Plotty ran the numbers and the fox is currently producing 0q/hr of clarity.",
-        "Plotty believes the fox is an edge case with excellent marketing.",
-        "Plotty cannot quote the song, but Plotty can confirm the fox discourse is alive.",
-        "Plotty asked the fox for metrics and received interpretive blinking.",
-        "Plotty found fox tracks near the coop report and one suspicious kazoo.",
-        "Plotty says the fox has not completed registration and therefore cannot be ranked.",
-        "Plotty believes the fox is running a highly experimental sync schedule.",
-        "Plotty checked the fox folder. It contains vibes and one broken compass.",
-        "Plotty cannot confirm the fox's rate, but the confidence interval is chaotic.",
-        "Plotty suspects the fox is hiding inside a badly named variable.",
-        "Plotty has added the fox to the list of unresolved musical incidents.",
-        "Plotty says the fox answer requires Staff approval and better lighting.",
-        "Plotty believes the fox is a morale event disguised as a question.",
-        "Plotty scanned for fox data and found only glitter in the cache.",
-        "Plotty says the fox is not late, just narratively delayed.",
-        "Plotty is treating the fox as a seasonal egg with opinions.",
-        "Plotty found the fox in the margins of the contract notes.",
-        "Plotty has closed the fox ticket as `mysterious, working as designed`."
-    ];
-
-    private static readonly string[] FamiliarAsides = [
-        "Plotty recognizes this ledger energy.",
-        "Plotty has seen your name in the tiny chaos records.",
-        "The clipboard knows you now.",
-        "Plotty is developing a statistically questionable fondness for your nonsense.",
-        "This interaction has been filed under `regular customer behavior`.",
-        "Plotty is starting to recognize the shape of your chaos.",
-        "Your ledger aura is becoming familiar.",
-        "Plotty has upgraded you from `stranger` to `recurring subplot`.",
-        "The pub records are beginning to remember your stool.",
-        "Plotty has a tiny footnote with your name on it.",
-        "You are now a known variable in the social equation.",
-        "Plotty's familiarity meter just made a polite clicking noise.",
-        "The clipboard has stopped asking for your ID twice.",
-        "Plotty recognizes your brand of excellent trouble.",
-        "This is starting to feel like a recurring meeting with better snacks."
-    ];
-
-    private static readonly string[] ConversationGreetingLines = [
-        "Plotty is here and has put on the conversational clipboard.",
-        "Hello. Plotty is awake, socially calibrated, and only mildly over-indexed on eggs.",
-        "Plotty greets you with professional warmth and one tiny ledger flourish.",
-        "Hi. Plotty is listening with the seriousness of a spreadsheet at a pub.",
-        "Plotty has entered conversation mode. The tiny desk lamp is on."
-    ];
-
-    private static readonly string[] ConversationThankLines = [
-        "Plotty accepts the thanks and files it under `morale, precious`.",
-        "You are welcome. Plotty will now pretend not to glow slightly.",
-        "Plotty appreciates the appreciation. Very tidy. Very nourishing.",
-        "Anytime. Plotty lives for clean data and suspiciously kind words.",
-        "Plotty nods with all available pixels."
-    ];
-
-    private static readonly string[] ConversationLeadInLines = [
-        "Plotty can work with that. ",
-        "Ledger says: ",
-        "Short version from the clipboard: ",
-        "Plotty has a useful answer. ",
-        "Tiny desk lamp on. "
-    ];
-
-    private static readonly string[] UnknownQuestionReplies = [
-        "Generally, I would start by narrowing it to the goal, the current state, and what changed most recently. What part of it are you trying to decide or fix?",
-        "My broad answer is: check the simplest explanation first, then use the data to rule things out one at a time. What detail matters most here?",
-        "In general, I would compare what you expected to happen with what actually happened, then look for the first place they diverge. What are you seeing right now?",
-        "A good default is to make the next step small, reversible, and easy to verify. Are you asking about a command, a player, a contract, or something else?",
-        "Broadly speaking, I would treat it as a context problem: who is involved, what result do you want, and what information do we already have? Which of those should I focus on?",
-        "The general answer is to avoid guessing and work from the most reliable source available. Do you want me to reason from bot data, Egg Inc info, or guild rules?",
-        "If I am missing specifics, I would still start with the practical next action: identify the target, check the latest state, and decide what would confirm success. What is the target?",
-        "My general take is that the best answer depends on whether this is about performance, setup, fairness, or troubleshooting. Which lane is this in?"
-    ];
-
-    private static readonly string[] SmallTalkReplies = [
-        "I am following along. Give me a question and I will try to be useful instead of decorative.",
-        "I hear you. I can keep the conversation going if you give me the next thing you want to explore.",
-        "I can keep chatting. Ask me something specific and I will take a proper swing at it.",
-        "I am here for it. Tell me where you want to go next.",
-        "I have the thread. Keep going and I will follow the best I can."
-    ];
-
-    private static readonly string[] HumanSideNotes = [
-        "I am keeping the context in mind.",
-        "I will stay with the thread.",
-        "I am using what I remember from our recent exchanges.",
-        "I can adjust if you point me in a different direction.",
-        "I am trying to be direct and useful here.",
-        "I will ask when I need more detail.",
-        "I am following your lead.",
-        "I can keep going from there."
-    ];
-
-    public static string MentionResponse(string mention, bool isQuestion, PlottyMemory memory) =>
-        Speak($"{mention} {FamiliarAside(memory)}{Pick(isQuestion ? QuestionDiversions : MentionReplies)} {UniqueSpark(memory)}");
-
-    public static string Mood(PlottyMemory memory) {
-        var mood = Pick(Moods);
-        return Speak($"**Emoji story**\n{mood.Emoji}\n\n**Translation**\n{FamiliarAside(memory)}{mood.Story} {UniqueSpark(memory)}");
-    }
-
-    public static string Excuse(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(Excuses) + " " + UniqueSpark(memory));
-    public static string Wisdom(string mention, PlottyMemory memory) => Speak($"{mention} {FamiliarAside(memory)}{Pick(WisdomLines)} {UniqueSpark(memory)}");
-    public static string BeerThanksResponse(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(BeerThanks) + " " + UniqueSpark(memory));
-    public static string BeerGiftResponse(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(BeerGifts) + " " + UniqueSpark(memory));
-    public static string RegistrationWelcome(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(RegistrationWelcomes) + " " + UniqueSpark(memory));
-    public static string SarcasmResponse(string mention, PlottyMemory memory) => Speak($"{mention} {FamiliarAside(memory)}{Pick(SarcasmReplies)} {UniqueSpark(memory)}");
-    public static string FoxResponse(string mention, PlottyMemory memory) => Speak($"{mention} {FamiliarAside(memory)}{Pick(FoxReplies)} {UniqueSpark(memory)}");
-    public static string ConversationGreeting(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(ConversationGreetingLines) + " " + UniqueSpark(memory));
-    public static string ConversationThanks(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(ConversationThankLines) + " " + UniqueSpark(memory));
-    public static string ConversationLeadIn(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(ConversationLeadInLines) + UniqueSpark(memory) + " ");
-    public static string ConversationUnknownQuestion(PlottyMemory memory, string? previousTopic) {
-        var previous = string.IsNullOrWhiteSpace(previousTopic)
-            ? ""
-            : $" Last thing Plotty remembers here was `{previousTopic}`.";
-        return Speak(FamiliarAside(memory) + Pick(UnknownQuestionReplies) + previous + " " + UniqueSpark(memory));
-    }
-
-    public static string ConversationSmallTalk(PlottyMemory memory, string topic) =>
-        Speak(FamiliarAside(memory) + Pick(SmallTalkReplies) + " " + UniqueSpark(memory));
-
-    private static T Pick<T>(IReadOnlyList<T> values) =>
-        values[Random.Shared.Next(values.Count)];
-
-    private static string FamiliarAside(PlottyMemory memory) {
-        if(memory.TotalInteractions < 8 || Random.Shared.Next(4) != 0) {
-            return "";
-        }
-
-        return Pick(FamiliarAsides) + " ";
-    }
-
-    private static string UniqueSpark(PlottyMemory memory) {
-        if(Random.Shared.Next(3) == 0) {
-            return Pick(HumanSideNotes);
-        }
-
-        return "";
-    }
-
-    private static string Speak(string text) {
-        var result = text;
-        var replacements = new (string From, string To)[] {
-            ("Plotty's", "My"),
-            ("Plotty arrives", "I arrive"),
-            ("Plotty appears", "I appear"),
-            ("Plotty reports", "I report"),
-            ("Plotty responds", "I respond"),
-            ("Plotty acknowledges", "I acknowledge"),
-            ("Plotty greets", "I greet"),
-            ("Plotty lives", "I live"),
-            ("Plotty nods", "I nod"),
-            ("Plotty wants", "I want"),
-            ("Plotty needs", "I need"),
-            ("Plotty tried", "I tried"),
-            ("Plotty panicked", "I panicked"),
-            ("Plotty woke", "I woke"),
-            ("Plotty started", "I started"),
-            ("Plotty sorted", "I sorted"),
-            ("Plotty wrote", "I wrote"),
-            ("Plotty drank", "I drank"),
-            ("Plotty did", "I did"),
-            ("Plotty stayed", "I stayed"),
-            ("Plotty dropped", "I dropped"),
-            ("Plotty got", "I got"),
-            ("Plotty awards", "I award"),
-            ("Plotty salutes", "I salute"),
-            ("Plotty notes", "I note"),
-            ("Plotty refuses", "I refuse"),
-            ("Plotty advises", "I advise"),
-            ("Plotty suspects", "I suspect"),
-            ("Plotty treats", "I treat"),
-            ("Plotty has closed", "I have closed"),
-            ("Plotty has added", "I have added"),
-            ("Plotty has issued", "I have issued"),
-            ("Plotty has selected", "I have selected"),
-            ("Plotty has marked", "I have marked"),
-            ("Plotty has logged", "I have logged"),
-            ("Plotty has entered", "I have entered"),
-            ("Plotty has surfaced", "I have surfaced"),
-            ("Plotty has arrived", "I have arrived"),
-            ("Plotty has chosen", "I have chosen"),
-            ("for Plotty", "for me"),
-            ("to Plotty", "to me"),
-            ("Ask Plotty", "Ask me"),
-            ("Plotty cannot", "I cannot"),
-            ("Plotty can't", "I can't"),
-            ("Plotty can", "I can"),
-            ("Plotty does not", "I do not"),
-            ("Plotty doesn't", "I don't"),
-            ("Plotty did not", "I did not"),
-            ("Plotty didn't", "I didn't"),
-            ("Plotty would", "I would"),
-            ("Plotty will", "I will"),
-            ("Plotty should", "I should"),
-            ("Plotty could", "I could"),
-            ("Plotty has", "I have"),
-            ("Plotty had", "I had"),
-            ("Plotty is", "I am"),
-            ("Plotty was", "I was"),
-            ("Plotty thinks", "I think"),
-            ("Plotty believes", "I believe"),
-            ("Plotty says", "I say"),
-            ("Plotty hears", "I hear"),
-            ("Plotty heard", "I heard"),
-            ("Plotty accepts", "I accept"),
-            ("Plotty appreciates", "I appreciate"),
-            ("Plotty recognizes", "I recognize"),
-            ("Plotty recommends", "I recommend"),
-            ("Plotty checked", "I checked"),
-            ("Plotty translated", "I translated"),
-            ("Plotty found", "I found"),
-            ("Plotty scanned", "I scanned"),
-            ("Plotty asked", "I asked"),
-            ("Plotty ran", "I ran"),
-            ("Plotty bought", "I bought"),
-            ("Plotty buys", "I buy"),
-            ("Plotty returns", "I return"),
-            ("Plotty declares", "I declare"),
-            ("Plotty tips", "I tip"),
-            ("Plotty approves", "I approve"),
-            ("Plotty made", "I made"),
-            ("Plotty dusted", "I dusted"),
-            ("Plotty updated", "I updated"),
-            ("Plotty promises", "I promise"),
-            ("Plotty lit", "I lit"),
-            ("Plotty", "I")
-        };
-
-        foreach(var replacement in replacements) {
-            result = result.Replace(replacement.From, replacement.To, StringComparison.Ordinal);
-        }
-
-        return result;
-    }
-}
-
-public static class Egg9000ArtifactData {
-    private static readonly Lazy<IReadOnlyDictionary<int, AfxFamilyData>> Families = new(LoadFamilies);
-
-    public static double EffectDelta(ArtifactSpec spec) =>
-        ResolveEffect(spec)?.Delta ?? 0;
-
-    public static int SlotCount(ArtifactSpec spec) =>
-        ResolveEffect(spec)?.Slots ?? 0;
-
-    public static string? ProperName(ArtifactSpec spec) =>
-        ResolveTier(spec)?.Name;
-
-    public static string? IconFilename(ArtifactSpec spec) =>
-        ResolveTier(spec)?.IconFilename;
-
-    private static AfxTierData? ResolveTier(ArtifactSpec spec) {
-        if(!Families.Value.TryGetValue((int)spec.Name, out var family)) {
-            return null;
-        }
-
-        var tierNumber = IsStoneName(spec.Name) ? (int)spec.Level + 2 : (int)spec.Level + 1;
-        return family.Tiers.TryGetValue(tierNumber, out var tier) ? tier : null;
-    }
-
-    private static AfxEffectData? ResolveEffect(ArtifactSpec spec) {
-        var tier = ResolveTier(spec);
-        if(tier is null || tier.Effects.Count == 0) {
-            return null;
-        }
-
-        var rarity = IsStoneName(spec.Name) ? 0 : (int)spec.Rarity;
-        return tier.Effects.FirstOrDefault(e => e.Rarity == rarity)
-            ?? tier.Effects.FirstOrDefault(e => e.Rarity == 0)
-            ?? tier.Effects[0];
-    }
-
-    private static IReadOnlyDictionary<int, AfxFamilyData> LoadFamilies() {
-        var path = FindDataPath();
-        if(path is null) {
-            Console.WriteLine("Plotty could not find eiafx-data.json; artifact values will fall back to zero.");
-            return new Dictionary<int, AfxFamilyData>();
-        }
-
-        using var stream = File.OpenRead(path);
-        using var document = JsonDocument.Parse(stream);
-        if(!document.RootElement.TryGetProperty("artifact_families", out var familyElements)) {
-            return new Dictionary<int, AfxFamilyData>();
-        }
-
-        var result = new Dictionary<int, AfxFamilyData>();
-        foreach(var familyElement in familyElements.EnumerateArray()) {
-            if(!familyElement.TryGetProperty("afx_id", out var familyIdElement)) {
-                continue;
-            }
-
-            var familyIds = new HashSet<int> { familyIdElement.GetInt32() };
-            if(familyElement.TryGetProperty("child_afx_ids", out var childIds) && childIds.ValueKind == JsonValueKind.Array) {
-                foreach(var child in childIds.EnumerateArray()) {
-                    familyIds.Add(child.GetInt32());
-                }
-            }
-
-            var tiers = new Dictionary<int, AfxTierData>();
-            if(familyElement.TryGetProperty("tiers", out var tierElements) && tierElements.ValueKind == JsonValueKind.Array) {
-                foreach(var tierElement in tierElements.EnumerateArray()) {
-                    if(!tierElement.TryGetProperty("tier_number", out var tierNumberElement)) {
-                        continue;
-                    }
-
-                    var effects = new List<AfxEffectData>();
-                    if(tierElement.TryGetProperty("effects", out var effectElements) && effectElements.ValueKind == JsonValueKind.Array) {
-                        foreach(var effectElement in effectElements.EnumerateArray()) {
-                            var rarity = effectElement.TryGetProperty("afx_rarity", out var rarityElement) ? rarityElement.GetInt32() : 0;
-                            var delta = effectElement.TryGetProperty("effect_delta", out var deltaElement) ? deltaElement.GetDouble() : 0;
-                            int? slots = null;
-                            if(effectElement.TryGetProperty("slots", out var slotsElement) && slotsElement.ValueKind == JsonValueKind.Number) {
-                                slots = slotsElement.GetInt32();
-                            }
-
-                            effects.Add(new AfxEffectData(rarity, delta, slots));
-                        }
-                    }
-
-                    tiers[tierNumberElement.GetInt32()] = new AfxTierData(
-                        tierElement.TryGetProperty("name", out var nameElement) ? nameElement.GetString() ?? "" : "",
-                        tierElement.TryGetProperty("icon_filename", out var iconElement) ? iconElement.GetString() : null,
-                        effects);
-                }
-            }
-
-            var family = new AfxFamilyData(
-                familyElement.TryGetProperty("name", out var familyNameElement) ? familyNameElement.GetString() ?? "" : "",
-                familyElement.TryGetProperty("type", out var familyTypeElement) ? familyTypeElement.GetString() ?? "" : "",
-                tiers);
-            foreach(var familyId in familyIds) {
-                result[familyId] = family;
-            }
-        }
-
-        return result;
-    }
-
-    private static string? FindDataPath() {
-        var candidates = new[] {
-            Path.Combine(AppContext.BaseDirectory, "eiafx-data.json"),
-            Path.Combine(Directory.GetCurrentDirectory(), "eiafx-data.json"),
-            Path.Combine(Directory.GetCurrentDirectory(), "src", "EggContributionBot", "eiafx-data.json")
-        };
-
-        return candidates.FirstOrDefault(File.Exists);
-    }
-
-    private static bool IsStoneName(ArtifactSpec.Types.Name name) =>
-        name is ArtifactSpec.Types.Name.TachyonStone
-            or ArtifactSpec.Types.Name.DilithiumStone
-            or ArtifactSpec.Types.Name.ShellStone
-            or ArtifactSpec.Types.Name.LunarStone
-            or ArtifactSpec.Types.Name.SoulStone
-            or ArtifactSpec.Types.Name.ProphecyStone
-            or ArtifactSpec.Types.Name.QuantumStone
-            or ArtifactSpec.Types.Name.TerraStone
-            or ArtifactSpec.Types.Name.LifeStone
-            or ArtifactSpec.Types.Name.ClarityStone;
-}
-
-public sealed record AfxFamilyData(string Name, string Type, IReadOnlyDictionary<int, AfxTierData> Tiers);
-public sealed record AfxTierData(string Name, string? IconFilename, IReadOnlyList<AfxEffectData> Effects);
-public sealed record AfxEffectData(int Rarity, double Delta, int? Slots);
-
-public sealed class EggWikiClient {
-    private const string ApiBase = "https://egg-inc.fandom.com/api.php";
-    private static readonly HttpClient Http = new();
-    private static readonly Regex SentenceSplit = new(@"(?<=[.!?])\s+", RegexOptions.Compiled);
-    private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase) {
-        "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
-        "how", "i", "in", "is", "it", "me", "of", "on", "or", "the", "to", "what", "when",
-        "where", "which", "who", "why", "with", "you", "your"
-    };
-
-    static EggWikiClient() {
-        Http.DefaultRequestHeaders.UserAgent.ParseAdd("PlottyDiscordBot/1.0");
-    }
-
-    public async Task<WikiAnswer?> AnswerAsync(string question) {
-        var title = await SearchAsync(question);
-        if(string.IsNullOrWhiteSpace(title)) {
-            return null;
-        }
-
-        var page = await GetExtractAsync(title);
-        if(page is null || string.IsNullOrWhiteSpace(page.Value.Extract)) {
-            return null;
-        }
-
-        var answer = BuildAnswer(question, page.Value.Extract);
-        if(string.IsNullOrWhiteSpace(answer)) {
-            return null;
-        }
-
-        return new WikiAnswer(
-            page.Value.Title,
-            $"https://egg-inc.fandom.com/wiki/{Uri.EscapeDataString(page.Value.Title.Replace(' ', '_'))}",
-            answer);
-    }
-
-    private static async Task<string?> SearchAsync(string question) {
-        var url = $"{ApiBase}?action=query&list=search&srsearch={Uri.EscapeDataString(question)}&srlimit=1&format=json&utf8=1";
-        using var stream = await Http.GetStreamAsync(url);
-        using var doc = await JsonDocument.ParseAsync(stream);
-        var results = doc.RootElement.GetProperty("query").GetProperty("search");
-        return results.GetArrayLength() == 0
-            ? null
-            : results[0].GetProperty("title").GetString();
-    }
-
-    private static async Task<(string Title, string Extract)?> GetExtractAsync(string title) {
-        var url = $"{ApiBase}?action=query&prop=extracts&explaintext=1&redirects=1&format=json&titles={Uri.EscapeDataString(title)}&utf8=1";
-        using var stream = await Http.GetStreamAsync(url);
-        using var doc = await JsonDocument.ParseAsync(stream);
-        var pages = doc.RootElement.GetProperty("query").GetProperty("pages");
-        foreach(var page in pages.EnumerateObject()) {
-            if(!page.Value.TryGetProperty("extract", out var extractElement)) {
-                continue;
-            }
-
-            var resolvedTitle = page.Value.TryGetProperty("title", out var titleElement)
-                ? titleElement.GetString() ?? title
-                : title;
-            return (resolvedTitle, WebUtility.HtmlDecode(extractElement.GetString() ?? ""));
-        }
-
-        return null;
-    }
-
-    private static string BuildAnswer(string question, string extract) {
-        var keywords = Regex.Matches(question.ToLowerInvariant(), "[a-z0-9]+")
-            .Select(m => m.Value)
-            .Where(w => w.Length > 2 && !StopWords.Contains(w))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var sentences = SentenceSplit
-            .Split(Regex.Replace(extract, @"\s+", " ").Trim())
-            .Where(s => s.Length is > 30 and < 450)
-            .Select(s => new {
-                Text = s.Trim(),
-                Score = keywords.Count(k => s.Contains(k, StringComparison.OrdinalIgnoreCase))
-            })
-            .OrderByDescending(s => s.Score)
-            .ThenBy(s => extract.IndexOf(s.Text, StringComparison.OrdinalIgnoreCase))
-            .Take(3)
-            .Select(s => s.Text)
-            .ToList();
-
-        if(sentences.Count == 0) {
-            return TrimForDiscord(extract);
-        }
-
-        return TrimForDiscord(string.Join(" ", sentences));
-    }
-
-    private static string TrimForDiscord(string value) =>
-        value.Length <= 1500 ? value : value[..1497] + "...";
-}
-
-public sealed class DataStore {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
-    private readonly string _path;
-    private readonly SecureText _secureText;
-    private readonly SemaphoreSlim _gate = new(1, 1);
-
-    public DataStore(string path, SecureText secureText) {
-        _path = Path.GetFullPath(path);
-        _secureText = secureText;
-        Directory.CreateDirectory(Path.GetDirectoryName(_path) ?? ".");
-    }
-
-    public async Task LinkAsync(EggUserLink link) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            state.Links.RemoveAll(l =>
-                l.GuildId == link.GuildId &&
-                l.EggId.Equals(link.EggId, StringComparison.OrdinalIgnoreCase));
-            state.Links.Add(link);
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<EggUserLink>> GetLinksAsync(ulong guildId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.Links.Where(l => l.GuildId == guildId).ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyDictionary<string, EggUserLink>> GetLinksByEggIdAsync(ulong guildId) {
-        var links = await GetLinksAsync(guildId);
-        return links
-            .GroupBy(l => l.EggId, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
-    }
-
-    public async Task SaveRegisteredEidAsync(ulong guildId, ulong discordUserId, string eid, string? eggName) {
-        var normalized = EggIncClient.NormalizeEggId(eid);
-        var hash = SecureText.Sha256(normalized);
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            state.RegisteredEids.RemoveAll(e => e.GuildId == guildId && e.EidHash.Equals(hash, StringComparison.OrdinalIgnoreCase));
-            state.RegisteredEids.Add(new RegisteredEid(
-                guildId,
-                discordUserId,
-                hash,
-                _secureText.Encrypt(normalized),
-                eggName,
-                DateTimeOffset.UtcNow));
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<string?> GetRegisteredEidAsync(ulong guildId, ulong discordUserId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var record = state.RegisteredEids.LastOrDefault(e => e.GuildId == guildId && e.DiscordUserId == discordUserId);
-            return record is null ? null : _secureText.Decrypt(record.EncryptedEid);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<RegisteredEggAccount?> GetRegisteredAccountAsync(ulong guildId, ulong discordUserId) {
-        var accounts = await GetRegisteredAccountsAsync(guildId, discordUserId);
-        return accounts.FirstOrDefault();
-    }
-
-    public async Task<IReadOnlyList<RegisteredEggAccount>> GetRegisteredAccountsAsync(ulong guildId, ulong discordUserId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.RegisteredEids
-                .Where(e => e.GuildId == guildId && e.DiscordUserId == discordUserId)
-                .OrderByDescending(e => e.UpdatedAt)
-                .Select(e => new RegisteredEggAccount(e.DiscordUserId, _secureText.Decrypt(e.EncryptedEid), e.EggName, e.UpdatedAt))
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<RegisteredEggAccount>> GetRegisteredEidsAsync(ulong guildId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.RegisteredEids
-                .Where(e => e.GuildId == guildId)
-                .GroupBy(e => e.EidHash, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.OrderByDescending(e => e.UpdatedAt).First())
-                .Select(e => new RegisteredEggAccount(e.DiscordUserId, _secureText.Decrypt(e.EncryptedEid), e.EggName, e.UpdatedAt))
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<int> AddDemeritsAsync(
-        ulong guildId,
-        ulong discordUserId,
-        int amount,
-        string reason,
-        string? contractId,
-        string? sourceKey,
-        string? playerName = null) {
-        amount = Math.Max(1, amount);
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            for(var i = 0; i < amount; i++) {
-                state.Demerits.Add(new DemeritEntry(
-                    Guid.NewGuid().ToString("N"),
-                    guildId,
-                    discordUserId,
-                    1,
-                    reason,
-                    contractId,
-                    playerName,
-                    sourceKey,
-                    now,
-                    now.AddDays(30),
-                    RemovedAt: null));
-            }
-
-            await SaveAsync(state);
-            return amount;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<DemeritEntry>> AddAutoDemeritsAsync(
-        ulong guildId,
-        IReadOnlyList<AutoDemeritCandidate> candidates) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var activeSourceKeys = state.Demerits
-                .Where(d => d.GuildId == guildId && d.RemovedAt is null && d.ExpiresAt > now && !string.IsNullOrWhiteSpace(d.SourceKey))
-                .Select(d => d.SourceKey!)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            var added = new List<DemeritEntry>();
-            foreach(var candidate in candidates
-                .GroupBy(c => c.SourceKey, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.First())) {
-                if(activeSourceKeys.Contains(candidate.SourceKey)) {
-                    continue;
-                }
-
-                var entry = new DemeritEntry(
-                    Guid.NewGuid().ToString("N"),
-                    guildId,
-                    candidate.DiscordUserId,
-                    1,
-                    "Auto: under 2q/hr after 18h",
-                    candidate.ContractId,
-                    candidate.PlayerName,
-                    candidate.SourceKey,
-                    now,
-                    now.AddDays(30),
-                    RemovedAt: null);
-                state.Demerits.Add(entry);
-                added.Add(entry);
-                activeSourceKeys.Add(candidate.SourceKey);
-            }
-
-            if(added.Count > 0) {
-                await SaveAsync(state);
-            }
-
-            return added;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<int> RemoveDemeritsAsync(ulong guildId, ulong discordUserId, int amount) {
-        amount = Math.Max(1, amount);
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var active = state.Demerits
-                .Where(d => d.GuildId == guildId && d.DiscordUserId == discordUserId && d.RemovedAt is null && d.ExpiresAt > now)
-                .OrderByDescending(d => d.CreatedAt)
-                .Take(amount)
-                .ToList();
-
-            foreach(var entry in active) {
-                var index = state.Demerits.FindIndex(d => d.Id == entry.Id);
-                if(index >= 0) {
-                    state.Demerits[index] = entry with { RemovedAt = now };
-                }
-            }
-
-            if(active.Count > 0) {
-                await SaveAsync(state);
-            }
-
-            return active.Count;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<DemeritEntry>> GetActiveDemeritsAsync(ulong guildId, ulong? discordUserId = null) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            return state.Demerits
-                .Where(d => d.GuildId == guildId && d.RemovedAt is null && d.ExpiresAt > now)
-                .Where(d => discordUserId is null || d.DiscordUserId == discordUserId.Value)
-                .OrderBy(d => d.ExpiresAt)
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<bool> HasMissingJoinAlertAsync(string key) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.MissingJoinAlerts.Any(a => a.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task RecordMissingJoinAlertAsync(string key) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            if(state.MissingJoinAlerts.Any(a => a.Key.Equals(key, StringComparison.OrdinalIgnoreCase))) {
-                return;
-            }
-
-            var cutoff = DateTimeOffset.UtcNow.AddDays(-90);
-            state.MissingJoinAlerts.RemoveAll(a => a.PostedAt < cutoff);
-            state.MissingJoinAlerts.Add(new MissingJoinAlert(key, DateTimeOffset.UtcNow));
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<ContractLateNotice> RecordContractLateNoticeAsync(
-        ulong guildId,
-        ulong discordUserId,
-        string? contractId,
-        string? eta,
-        string? note) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var normalizedContractId = string.IsNullOrWhiteSpace(contractId) ? null : contractId.Trim();
-            state.ContractLateNotices.RemoveAll(n =>
-                n.GuildId == guildId &&
-                n.DiscordUserId == discordUserId &&
-                string.Equals(n.ContractId ?? "", normalizedContractId ?? "", StringComparison.OrdinalIgnoreCase));
-            state.ContractLateNotices.RemoveAll(n => n.ExpiresAt <= now);
-
-            var notice = new ContractLateNotice(
-                guildId,
-                discordUserId,
-                normalizedContractId,
-                eta,
-                note,
-                now,
-                now.AddHours(48));
-            state.ContractLateNotices.Add(notice);
-            await SaveAsync(state);
-            return notice;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlySet<ulong>> GetActiveContractLateNoticeUserIdsAsync(ulong guildId, string contractId) {
-        await _gate.WaitAsync();
-        try {
-            var now = DateTimeOffset.UtcNow;
-            var state = await LoadAsync();
-            state.ContractLateNotices.RemoveAll(n => n.ExpiresAt <= now);
-            return state.ContractLateNotices
-                .Where(n => n.GuildId == guildId && n.ExpiresAt > now)
-                .Where(n => string.IsNullOrWhiteSpace(n.ContractId) || string.Equals(n.ContractId, contractId, StringComparison.OrdinalIgnoreCase))
-                .Select(n => n.DiscordUserId)
-                .ToHashSet();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<int> RemoveContractLateNoticesAsync(ulong guildId, ulong discordUserId, string? contractId) {
-        await _gate.WaitAsync();
-        try {
-            var now = DateTimeOffset.UtcNow;
-            var state = await LoadAsync();
-            var removed = state.ContractLateNotices.RemoveAll(n =>
-                n.GuildId == guildId &&
-                n.DiscordUserId == discordUserId &&
-                n.ExpiresAt > now &&
-                (string.IsNullOrWhiteSpace(contractId) || string.Equals(n.ContractId, contractId, StringComparison.OrdinalIgnoreCase)));
-            state.ContractLateNotices.RemoveAll(n => n.ExpiresAt <= now);
-
-            if(removed > 0) {
-                await SaveAsync(state);
-            }
-
-            return removed;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task UpsertShipReturnNotificationAsync(ShipReturnNotification notification) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            state.ShipReturnNotifications.RemoveAll(n =>
-                n.Key.Equals(notification.Key, StringComparison.OrdinalIgnoreCase) ||
-                (n.NotifiedAt is not null && n.NotifiedAt < now.AddDays(-7)) ||
-                (n.NotifiedAt is null && n.ReturnAt < now.AddDays(-2)));
-            state.ShipReturnNotifications.Add(notification);
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<ShipReturnNotification>> GetDueShipReturnNotificationsAsync(ulong guildId, DateTimeOffset now) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.ShipReturnNotifications
-                .Where(n => n.GuildId == guildId && n.NotifiedAt is null && n.ReturnAt <= now)
-                .OrderBy(n => n.ReturnAt)
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task MarkShipReturnNotificationSentAsync(string key, DateTimeOffset sentAt) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var index = state.ShipReturnNotifications.FindIndex(n => n.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
-            if(index < 0) {
-                return;
-            }
-
-            state.ShipReturnNotifications[index] = state.ShipReturnNotifications[index] with { NotifiedAt = sentAt };
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<BeerAttemptResult> TryAddPlottyBeerAsync(ulong guildId, ulong discordUserId, bool botBuysBack, bool bypassCooldown = false) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var index = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == discordUserId);
-            var current = index >= 0
-                ? state.BeerStats[index]
-                : new BeerStats(guildId, discordUserId, 0, 0, now, now, null);
-            var nextBeerAt = current.LastBeerAt.AddHours(1);
-            if(!bypassCooldown && index >= 0 && nextBeerAt > now) {
-                return new BeerAttemptResult(false, current, nextBeerAt - now);
-            }
-
-            var updated = current with {
-                BeersGivenToBot = current.BeersGivenToBot + 1,
-                BeersBoughtByBot = current.BeersBoughtByBot + (botBuysBack ? 1 : 0),
-                LastBeerAt = now,
-                LastBotBeerAt = botBuysBack ? now : current.LastBotBeerAt
-            };
-
-            if(index >= 0) {
-                state.BeerStats[index] = updated;
-            } else {
-                state.BeerStats.Add(updated);
-            }
-
-            await SaveAsync(state);
-            return new BeerAttemptResult(true, updated, null);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<BeerAttemptResult> TryGiftBeerAsync(ulong guildId, ulong giverDiscordUserId, ulong recipientDiscordUserId, bool bypassCooldown = false) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var lastGift = state.BeerGiftLogs
-                .Where(g => g.GuildId == guildId && g.GiverDiscordUserId == giverDiscordUserId && g.RecipientDiscordUserId == recipientDiscordUserId)
-                .OrderByDescending(g => g.GiftedAt)
-                .FirstOrDefault();
-            var nextGiftAt = lastGift?.GiftedAt.AddDays(1);
-
-            var recipientIndex = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == recipientDiscordUserId);
-            var recipient = recipientIndex >= 0
-                ? state.BeerStats[recipientIndex]
-                : new BeerStats(guildId, recipientDiscordUserId, 0, 0, now, now, null);
-
-            if(!bypassCooldown && nextGiftAt is not null && nextGiftAt > now) {
-                return new BeerAttemptResult(false, recipient, nextGiftAt.Value - now);
-            }
-
-            var giverIndex = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == giverDiscordUserId);
-            var giver = giverIndex >= 0
-                ? state.BeerStats[giverIndex]
-                : new BeerStats(guildId, giverDiscordUserId, 0, 0, now, now, null);
-
-            var updatedRecipient = recipient with {
-                BeersReceivedFromMembers = recipient.BeersReceivedFromMembers + 1,
-                LastMemberBeerReceivedAt = now
-            };
-            var updatedGiver = giver with {
-                BeersGivenToMembers = giver.BeersGivenToMembers + 1,
-                LastMemberBeerGivenAt = now
-            };
-
-            if(recipientIndex >= 0) {
-                state.BeerStats[recipientIndex] = updatedRecipient;
-            } else {
-                state.BeerStats.Add(updatedRecipient);
-            }
-
-            if(giverDiscordUserId == recipientDiscordUserId) {
-                var selfIndex = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == giverDiscordUserId);
-                state.BeerStats[selfIndex] = updatedRecipient with {
-                    BeersGivenToMembers = updatedRecipient.BeersGivenToMembers + 1,
-                    LastMemberBeerGivenAt = now
-                };
-            } else if(giverIndex >= 0) {
-                state.BeerStats[giverIndex] = updatedGiver;
-            } else {
-                state.BeerStats.Add(updatedGiver);
-            }
-
-            state.BeerGiftLogs.Add(new BeerGiftLog(guildId, giverDiscordUserId, recipientDiscordUserId, now));
-            await SaveAsync(state);
-            return new BeerAttemptResult(true, updatedRecipient, null);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<BeerStats>> GetBeerLeaderboardAsync(ulong guildId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.BeerStats
-                .Where(b => b.GuildId == guildId)
-                .OrderByDescending(b => b.BeersBoughtByBot)
-                .ThenByDescending(b => b.BeersGivenToBot)
-                .ThenBy(b => b.FirstBeerAt)
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<PlottyMemory> RecordPlottyInteractionAsync(ulong guildId, ulong discordUserId, string interactionType) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var index = state.PlottyMemories.FindIndex(m => m.GuildId == guildId && m.DiscordUserId == discordUserId);
-            var current = index >= 0
-                ? state.PlottyMemories[index]
-                : new PlottyMemory(guildId, discordUserId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, now, now);
-
-            var updated = interactionType switch {
-                "mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, LastSeenAt = now },
-                "question_mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, QuestionsDodged = current.QuestionsDodged + 1, LastSeenAt = now },
-                "sarcasm" => current with { TotalInteractions = current.TotalInteractions + 1, SarcasmDetected = current.SarcasmDetected + 1, LastSeenAt = now },
-                "fox" => current with { TotalInteractions = current.TotalInteractions + 1, FoxMoments = current.FoxMoments + 1, LastSeenAt = now },
-                "beer_plotty" or "beer_bot_buyback" => current with { TotalInteractions = current.TotalInteractions + 1, Beers = current.Beers + 1, LastSeenAt = now },
-                "registration" => current with { TotalInteractions = current.TotalInteractions + 1, Registrations = current.Registrations + 1, LastSeenAt = now },
-                "mood" => current with { TotalInteractions = current.TotalInteractions + 1, MoodChecks = current.MoodChecks + 1, LastSeenAt = now },
-                "excuse" => current with { TotalInteractions = current.TotalInteractions + 1, Excuses = current.Excuses + 1, LastSeenAt = now },
-                "wisdom" => current with { TotalInteractions = current.TotalInteractions + 1, WisdomRequests = current.WisdomRequests + 1, LastSeenAt = now },
-                _ => current with { TotalInteractions = current.TotalInteractions + 1, LastSeenAt = now }
-            };
-
-            if(index >= 0) {
-                state.PlottyMemories[index] = updated;
-            } else {
-                state.PlottyMemories.Add(updated);
-            }
-
-            await SaveAsync(state);
-            return updated;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<PlottyConversationState?> GetPlottyConversationAsync(ulong guildId, ulong discordUserId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var cutoff = DateTimeOffset.UtcNow.AddHours(-6);
-            return state.PlottyConversations
-                .Where(c => c.GuildId == guildId && c.DiscordUserId == discordUserId && c.LastSeenAt >= cutoff)
-                .OrderByDescending(c => c.LastSeenAt)
-                .FirstOrDefault();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<PlottyConversationState> RecordPlottyConversationAsync(ulong guildId, ulong discordUserId, string topic) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var cutoff = now.AddDays(-14);
-            state.PlottyConversations.RemoveAll(c => c.LastSeenAt < cutoff);
-
-            var cleanTopic = string.IsNullOrWhiteSpace(topic) ? "chat" : topic.Trim();
-            if(cleanTopic.Length > 80) {
-                cleanTopic = cleanTopic[..80];
-            }
-
-            var index = state.PlottyConversations.FindIndex(c => c.GuildId == guildId && c.DiscordUserId == discordUserId);
-            var current = index >= 0
-                ? state.PlottyConversations[index]
-                : new PlottyConversationState(guildId, discordUserId, cleanTopic, 0, now, now);
-            var updated = current with {
-                LastTopic = cleanTopic,
-                Turns = current.Turns + 1,
-                LastSeenAt = now
-            };
-
-            if(index >= 0) {
-                state.PlottyConversations[index] = updated;
-            } else {
-                state.PlottyConversations.Add(updated);
-            }
-
-            await SaveAsync(state);
-            return updated;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    private async Task<State> LoadAsync() {
-        if(!File.Exists(_path)) {
-            return new State();
-        }
-
-        await using var stream = File.OpenRead(_path);
-        return await JsonSerializer.DeserializeAsync<State>(stream, JsonOptions) ?? new State();
-    }
-
-    private async Task SaveAsync(State state) {
-        var tmp = _path + ".tmp";
-        await using(var stream = File.Create(tmp)) {
-            await JsonSerializer.SerializeAsync(stream, state, JsonOptions);
-        }
-        File.Move(tmp, _path, overwrite: true);
-    }
-
-    private sealed class State {
-        public List<EggUserLink> Links { get; set; } = [];
-        public List<RegisteredEid> RegisteredEids { get; set; } = [];
-        public List<DemeritEntry> Demerits { get; set; } = [];
-        public List<MissingJoinAlert> MissingJoinAlerts { get; set; } = [];
-        public List<ContractLateNotice> ContractLateNotices { get; set; } = [];
-        public List<ShipReturnNotification> ShipReturnNotifications { get; set; } = [];
-        public List<BeerStats> BeerStats { get; set; } = [];
-        public List<BeerGiftLog> BeerGiftLogs { get; set; } = [];
-        public List<PlottyMemory> PlottyMemories { get; set; } = [];
-        public List<PlottyConversationState> PlottyConversations { get; set; } = [];
-    }
-}
