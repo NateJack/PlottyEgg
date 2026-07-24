@@ -6,12 +6,12 @@ using EggContribBot.Proto;
 
 namespace EggContribBot.Commands;
 
-class FunCommands(DataStore dataStore)
+class FunCommands(DataStore dataStore, EggIncClient eggClient)
 {
     private readonly EggWikiClient _wikiClient = new EggWikiClient();
     private readonly DataStore _dataStore = dataStore;
 
-    private readonly EggIncClient _eggClient = new EggIncClient();
+    private readonly EggIncClient _eggClient = eggClient;
 
     public async Task HandleHelpAsync(SocketSlashCommand command) {
         await command.DeferAsync();

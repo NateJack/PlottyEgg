@@ -504,8 +504,8 @@ public sealed class DataStore : IDisposable {
                 ?? new PlottyMemory(guildId, discordUserId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, now, now);
             var updated = interactionType switch {
                 "mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, LastSeenAt = now },
-                "question_mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, QuestionsDodged = current.QuestionsDodged + 1, LastSeenAt = now },
-                "sarcasm" => current with { TotalInteractions = current.TotalInteractions + 1, SarcasmDetected = current.SarcasmDetected + 1, LastSeenAt = now },
+                //"question_mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, QuestionsDodged = current.QuestionsDodged + 1, LastSeenAt = now },
+                //"sarcasm" => current with { TotalInteractions = current.TotalInteractions + 1, SarcasmDetected = current.SarcasmDetected + 1, LastSeenAt = now },
                 "fox" => current with { TotalInteractions = current.TotalInteractions + 1, FoxMoments = current.FoxMoments + 1, LastSeenAt = now },
                 "beer_plotty" or "beer_bot_buyback" => current with { TotalInteractions = current.TotalInteractions + 1, Beers = current.Beers + 1, LastSeenAt = now },
                 "registration" => current with { TotalInteractions = current.TotalInteractions + 1, Registrations = current.Registrations + 1, LastSeenAt = now },

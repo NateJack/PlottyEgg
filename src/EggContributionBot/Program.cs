@@ -22,6 +22,7 @@ var secureText = new SecureText(settings.Storage.KeyPath);
 var dataStore = new DataStore(settings.Storage.DataPath, secureText);
 await dataStore.RemoveLegacyPlaintextLinksAsync();
 var eggClient = new EggIncClient();
+Helpers.Initialize(settings, eggClient);
 var egg9000Client = new Egg9000Client(settings.Egg9000);
 var plottyAiClient = new PlottyAiClient(settings.OpenAi);
 var monitorHealth = new MonitorHealthService();
@@ -30,7 +31,8 @@ var shipReturnMonitorsStarted = new HashSet<ulong>();
 var firstCoopAwardMonitorsStarted = new HashSet<ulong>();
 var tokenLeaderboardMonitorsStarted = new HashSet<ulong>();
 var contractCommands = new ContractCommands(eggClient);
-var funCommands = new FunCommands(dataStore);
+var funCommands = new FunCommands(dataStore, eggClient);
+var adminCommands = new AdminCommands(dataStore);
 
 const int MaxEggIncAccountConcurrency = 4;
 
@@ -38,6 +40,8 @@ var client = new DiscordSocketClient(new DiscordSocketConfig {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMembers | GatewayIntents.GuildMessages | GatewayIntents.MessageContent,
     AlwaysDownloadUsers = true
 });
+// TODO: Remove dependancy on global client.
+var utilityCommands = new UtilityCommands(dataStore, eggClient, client);
 
 Console.WriteLine(plottyAiClient.IsConfigured
     ? $"Plotty AI chat is enabled with model {settings.OpenAi!.EffectiveModel}."
@@ -107,16 +111,16 @@ client.SlashCommandExecuted += async command => {
                 await HandleContractLateNotifyAsync(command);
                 break;
             case "admin-remove-late-notify":
-                await HandleAdminRemoveLateNotifyAsync(command);
+                await adminCommands.HandleAdminRemoveLateNotifyAsync(command);
                 break;
             case "register-eid":
-                await HandleRegisterEidAsync(command);
+                await utilityCommands.HandleRegisterEidAsync(command);
                 break;
             case "rates":
                 await HandleRatesAsync(command);
                 break;
             case "admin-rates-all":
-                await HandleRatesAllAsync(command);
+                await adminCommands.HandleRatesAllAsync(command);
                 break;
             case "admin-member-contract":
                 await HandleAdminMemberContractAsync(command);
@@ -254,7 +258,7 @@ client.ModalSubmitted += async modal => {
             return;
         }
 
-        await HandleRegisterEidModalAsync(modal);
+        await utilityCommands.HandleRegisterEidModalAsync(modal);
     } catch(Exception ex) {
         Console.WriteLine(ex);
         if(modal.HasResponded) {
@@ -291,11 +295,11 @@ client.MessageReceived += async message => {
 
         if(mentionedPlotty || repliedToPlotty) {
             var prompt = StripBotMention(message.Content);
-            var isQuestion = LooksLikeQuestion(prompt);
+            //var isQuestion = LooksLikeQuestion(prompt);
             var memory = await dataStore.RecordPlottyInteractionAsync(
                 guildChannel.Guild.Id,
                 message.Author.Id,
-                isQuestion ? "question_mention" : "mention");
+                "mention"); //isQuestion ? "question_mention" : "mention");
             var response = await plottyAiClient.GenerateReplyAsync(
                 guildChannel.Guild.Id,
                 message.Author.Id,
@@ -308,10 +312,10 @@ client.MessageReceived += async message => {
             return;
         }
 
-        if(LooksLikeSarcasm(message.Content) && Random.Shared.Next(100) == 0) {
-            var memory = await dataStore.RecordPlottyInteractionAsync(guildChannel.Guild.Id, message.Author.Id, "sarcasm");
-            await message.Channel.SendMessageAsync(PlottyPersonality.SarcasmResponse(message.Author.Mention, memory));
-        }
+        // if(LooksLikeSarcasm(message.Content) && Random.Shared.Next(100) == 0) { // double counting interactions, random element, what is the point of this?
+        //     var memory = await dataStore.RecordPlottyInteractionAsync(guildChannel.Guild.Id, message.Author.Id, "sarcasm");
+        //     await message.Channel.SendMessageAsync(PlottyPersonality.SarcasmResponse(message.Author.Mention, memory));
+        // }
     } catch(Exception ex) {
         Console.WriteLine(ex);
     }
@@ -659,24 +663,6 @@ static DateTimeOffset ToGuildLocalTime(DateTimeOffset value) {
     }
 }
 
-async Task HandleAdminRemoveLateNotifyAsync(SocketSlashCommand command) {
-    var staffUser = command.User as SocketGuildUser;
-    if(staffUser is null || !HasStaffRole(staffUser)) {
-        await command.RespondAsync("Only members with the Staff role can remove late notices.", ephemeral: true);
-        return;
-    }
-
-    var member = (SocketGuildUser)command.Data.Options.First(o => o.Name == "member").Value;
-    var contractId = (command.Data.Options.FirstOrDefault(o => o.Name == "contract-id")?.Value as string)?.Trim();
-    var removed = await dataStore.RemoveContractLateNoticesAsync(
-        command.GuildId!.Value,
-        member.Id,
-        string.IsNullOrWhiteSpace(contractId) ? null : contractId);
-
-    var scope = string.IsNullOrWhiteSpace(contractId) ? "all active late notices" : $"active late notices for `{contractId}`";
-    await command.RespondAsync($"Removed `{removed}` {scope} from {member.Mention}.", ephemeral: true);
-}
-
 async Task HandleRatesAsync(SocketSlashCommand command) {
     await command.DeferAsync(ephemeral: true);
     await HandleRegisteredRatesAsync(command);
@@ -796,70 +782,6 @@ async Task<IReadOnlyList<Embed>> BuildRecentCompletedRateEmbedsAsync(
     }
 
     return embeds;
-}
-
-async Task HandleRatesAllAsync(SocketSlashCommand command) {
-    var staffUser = command.User as SocketGuildUser;
-    if(staffUser is null || !HasStaffRole(staffUser)) {
-        await command.RespondAsync("Only members with the Staff role can use admin rates.", ephemeral: true);
-        return;
-    }
-
-    await command.DeferAsync(ephemeral: true);
-
-    var accounts = await dataStore.GetRegisteredEidsAsync(command.GuildId!.Value);
-    if(accounts.Count == 0) {
-        await command.FollowupAsync("No EIDs are registered in this server yet. Have players run `/register-eid` first.", ephemeral: true);
-        return;
-    }
-
-    var registeredEggIds = accounts
-        .Select(a => EggIncClient.NormalizeEggId(a.Eid))
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    var registeredNames = accounts
-        .Select(a => NormalizeName(a.EggName))
-        .Where(n => n.Length > 0)
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    var statusResult = await GetRecentRegisteredStatusesAsync(accounts);
-    if(statusResult.RecentContractCount == 0) {
-        await command.FollowupAsync("I could not find any active contracts released in the past 3 days.", ephemeral: true);
-        return;
-    }
-
-    if(statusResult.Statuses.Count == 0) {
-        await command.FollowupAsync(
-            $"I checked `{accounts.Count}` registered EID(s), but none had active co-op rates for contracts released in the past 3 days.",
-            ephemeral: true);
-        return;
-    }
-
-    var embeds = statusResult.Statuses.Values
-        .GroupBy(s => string.IsNullOrWhiteSpace(s.ContractIdentifier)
-            ? "(unknown contract)"
-            : s.ContractIdentifier,
-            StringComparer.OrdinalIgnoreCase)
-        .OrderBy(g => g.Key)
-        .Take(10)
-        .Select(g => BuildRegisteredContractEmbed(g.Key, g, registeredEggIds, registeredNames))
-        .Where(e => e is not null)
-        .Cast<Embed>()
-        .ToArray();
-
-    if(embeds.Length == 0) {
-        await command.FollowupAsync(
-            $"Plotty found `{statusResult.Statuses.Count}` active co-op(s), but none of their contributors matched a registered EID or registered Egg Inc name.",
-            ephemeral: true);
-        return;
-    }
-
-    var message = statusResult.Failed > 0
-        ? $"Showing registered EID players only for contracts released in the past 3 days. `{statusResult.Failed}` registered EID(s) did not return active rates."
-        : $"Showing registered EID players only for contracts released in the past 3 days from `{accounts.Count}` registered EID(s).";
-    if(statusResult.SkippedOldContracts > 0) {
-        message += $" Skipped `{statusResult.SkippedOldContracts}` older active co-op lookup(s).";
-    }
-
-    await command.FollowupAsync(text: message, embeds: embeds, ephemeral: true);
 }
 
 async Task HandleAdminMemberContractAsync(SocketSlashCommand command) {
@@ -1690,25 +1612,8 @@ static SocketTextChannel? FindNaughtyListChannel(SocketGuild guild) =>
 static SocketTextChannel? FindGeneralChannel(SocketGuild guild) =>
     guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "general");
 
-static SocketTextChannel? FindPlottyQuestionsChannel(SocketGuild guild) =>
-    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "plottyquestions");
-
 static SocketTextChannel? FindModLogChannel(SocketGuild guild) =>
     guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "modlog");
-
-async Task SendRegistrationWelcomeAsync(ulong guildId, IUser user) {
-    var guild = client.GetGuild(guildId);
-    var questionsChannel = guild is null ? null : FindPlottyQuestionsChannel(guild);
-    if(questionsChannel is null) {
-        return;
-    }
-
-    var displayName = user is SocketGuildUser guildUser ? guildUser.DisplayName : user.Username;
-    var memory = await dataStore.RecordPlottyInteractionAsync(guildId, user.Id, "registration");
-    await questionsChannel.SendMessageAsync(
-        $"{displayName} {PlottyPersonality.RegistrationWelcome(memory)}",
-        allowedMentions: AllowedMentions.None);
-}
 
 async Task HandleAddDemeritAsync(SocketSlashCommand command) {
     var staffUser = command.User as SocketGuildUser;
@@ -1811,48 +1716,6 @@ Task<IReadOnlyList<(RegisteredEggAccount Account, PlayerCoopLookupResult Lookup)
         accounts.ToList(),
         MaxEggIncAccountConcurrency,
         async account => (account, await eggClient.GetPlayerCoopLookupAsync(account.Eid)));
-
-async Task<(
-    IReadOnlyDictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse> Statuses,
-    int Failed,
-    int SkippedOldContracts,
-    int RecentContractCount)> GetRecentRegisteredStatusesAsync(IReadOnlyList<RegisteredEggAccount> accounts) {
-    var now = DateTimeOffset.UtcNow;
-    var recentContractIds = (await eggClient.GetCurrentContractsAsync())
-        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
-        .Where(c => c.StartTime > 0)
-        .Where(c => DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime) >= now.AddDays(-3))
-        .Where(c => c.ExpirationTime <= 0 || DateTimeOffset.FromUnixTimeSeconds((long)c.ExpirationTime) > now)
-        .Select(c => c.Identifier)
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    if(recentContractIds.Count == 0) {
-        return (new Dictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse>(), 0, 0, 0);
-    }
-
-    var statuses = new Dictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse>();
-    var failed = 0;
-    var skippedOldContracts = 0;
-    var lookups = await GetAccountCoopLookupsAsync(accounts);
-    foreach(var item in lookups) {
-        var lookup = item.Lookup;
-        if(lookup.Statuses.Count == 0) {
-            failed++;
-            continue;
-        }
-
-        foreach(var status in lookup.Statuses) {
-            if(!recentContractIds.Contains(status.ContractId)) {
-                skippedOldContracts++;
-                continue;
-            }
-
-            var key = (status.ContractId.ToLowerInvariant(), status.CoopCode.ToLowerInvariant());
-            statuses.TryAdd(key, status.Status);
-        }
-    }
-
-    return (statuses, failed, skippedOldContracts, recentContractIds.Count);
-}
 
 async Task HandleEggsLaidAsync(SocketSlashCommand command) {
     await command.DeferAsync(ephemeral: true);
@@ -1963,52 +1826,6 @@ async Task HandleShipsAsync(SocketSlashCommand command) {
     await command.FollowupAsync(text: text, embeds: embeds.ToArray(), ephemeral: true);
 }
 
-async Task HandleRegisterEidAsync(SocketSlashCommand command) {
-    var modal = new ModalBuilder()
-        .WithTitle("Register Egg Inc ID")
-        .WithCustomId("register-eid-modal")
-        .AddTextInput(
-            label: "Egg Inc ID",
-            customId: "eid",
-            style: TextInputStyle.Short,
-            placeholder: "EI1234567890123456",
-            minLength: 4,
-            maxLength: 32,
-            required: true)
-        .Build();
-
-    await command.RespondWithModalAsync(modal);
-}
-
-async Task HandleRegisterEidModalAsync(SocketModal modal) {
-    if(modal.GuildId is null) {
-        await modal.RespondAsync("Use Plotty inside your Discord server.", ephemeral: true);
-        return;
-    }
-
-    await modal.DeferAsync(ephemeral: true);
-
-    var eid = EggIncClient.NormalizeEggId(modal.Data.Components.First(c => c.CustomId == "eid").Value);
-    var validation = await eggClient.ValidateEggIdAsync(eid);
-    if(!validation.IsValid) {
-        await modal.FollowupAsync("Plotty could not validate that EID with Egg Inc. Please double-check it and try again.", ephemeral: true);
-        return;
-    }
-
-    var eggName = string.IsNullOrWhiteSpace(validation.EggName) ? null : validation.EggName;
-    await dataStore.SaveRegisteredEidAsync(modal.GuildId.Value, modal.User.Id, eid, eggName);
-
-    var accounts = await dataStore.GetRegisteredAccountsAsync(modal.GuildId.Value, modal.User.Id);
-    var suffix = SecureText.Sha256(eid)[..8];
-    var parseNote = validation.BackupParseLimited
-        ? " Egg Inc returned one malformed optional backup field, so I saved the EID without an Egg Inc display name for now."
-        : "";
-    await modal.FollowupAsync(
-        $"Saved your EID securely and tied it to your Discord name. You now have `{accounts.Count}` EID account(s) registered. Stored hash ending: `{suffix}`.{parseNote}",
-        ephemeral: true);
-
-    await SendRegistrationWelcomeAsync(modal.GuildId.Value, modal.User);
-}
 
 async Task HandleBeerPlottyAsync(SocketSlashCommand command) {
     var drink = GetString(command, "drink");
@@ -2276,41 +2093,6 @@ Embed? BuildContributionEmbed(
     return builder.Build();
 }
 
-Embed? BuildRegisteredContractEmbed(
-    string contractId,
-    IEnumerable<ContractCoopStatusResponse> statuses,
-    ISet<string> visibleUserIds,
-    ISet<string> visibleUserNames) {
-    var coopStatuses = statuses.ToList();
-    var players = coopStatuses
-        .SelectMany(s => s.Contributors)
-        .Where(c => IsRegisteredContributor(c, visibleUserIds, visibleUserNames))
-        .GroupBy(c => !string.IsNullOrWhiteSpace(c.UserId)
-            ? $"id:{EggIncClient.NormalizeEggId(c.UserId)}"
-            : $"name:{NormalizeName(c.UserName)}")
-        .Select(g => g.OrderByDescending(c => c.ContributionAmount).First())
-        .OrderBy(c => c.ContributionRate)
-        .ToList();
-
-    if(players.Count == 0) {
-        return null;
-    }
-
-    var lines = players.Select(p => {
-        var name = string.IsNullOrWhiteSpace(p.UserName) ? "(unknown)" : p.UserName;
-        var flag = !p.Active ? " inactive" : p.TimeCheatDetected ? " flagged" : "";
-        return $"**{name}** - {FormatEggs(p.ContributionRate * 3600)}/hr, {FormatEggs(p.ContributionAmount)} contributed{flag}";
-    });
-
-    return new EmbedBuilder()
-        .WithTitle(contractId)
-        .WithColor(Color.Gold)
-        .WithFooter($"Registered players across {coopStatuses.Count} co-op(s)")
-        .WithDescription(string.Join("\n", lines))
-        .WithCurrentTimestamp()
-        .Build();
-}
-
 async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string displayName, PlayerCoopLookupResult lookup) {
     var backup = lookup.Backup;
     var builder = new EmbedBuilder()
@@ -2414,7 +2196,7 @@ async Task<DashboardResult> BuildDashboardAsync(ulong guildId) {
         .GroupBy(a => NormalizeName(a.EggName), StringComparer.OrdinalIgnoreCase)
         .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
 
-    var statusResult = await GetRecentRegisteredStatusesAsync(accounts);
+    var statusResult = await Helpers.GetRecentRegisteredStatusesAsync(accounts);
     if(statusResult.RecentContractCount == 0) {
         return new DashboardResult("I could not find any active contracts released in the past 3 days.", [], []);
     }
@@ -2932,13 +2714,6 @@ static bool MatchesPlayerName(string contributorName, params string?[] knownName
                .Select(n => NormalizeName(n))
                .Any(n => n.Length > 0 && string.Equals(normalizedContributorName, n, StringComparison.OrdinalIgnoreCase));
 }
-
-bool IsRegisteredContributor(
-    ContractCoopStatusResponse.Types.ContributionInfo contributor,
-    ISet<string> visibleUserIds,
-    ISet<string> visibleUserNames) =>
-    (!string.IsNullOrWhiteSpace(contributor.UserId) && visibleUserIds.Contains(EggIncClient.NormalizeEggId(contributor.UserId))) ||
-    (!string.IsNullOrWhiteSpace(contributor.UserName) && visibleUserNames.Contains(NormalizeName(contributor.UserName)));
 
 RegisteredEggAccount? FindRegisteredAccount(
     ContractCoopStatusResponse.Types.ContributionInfo contributor,
@@ -3977,50 +3752,50 @@ static async Task<IReadOnlyList<TResult>> SelectWithConcurrencyAsync<TSource, TR
         .ToList();
 }
 
-static bool LooksLikeQuestion(string content) {
-    if(content.Contains('?')) {
-        return true;
-    }
+// static bool LooksLikeQuestion(string content) {
+//     if(content.Contains('?')) {
+//         return true;
+//     }
 
-    var normalized = Regex.Replace(content, @"<@!?\d+>", "", RegexOptions.Compiled).Trim().ToLowerInvariant();
-    string[] questionStarters = [
-        "who ", "what ", "when ", "where ", "why ", "how ", "can ", "could ", "would ",
-        "should ", "do ", "does ", "did ", "is ", "are ", "am ", "will ", "was ", "were "
-    ];
+//     var normalized = Regex.Replace(content, @"<@!?\d+>", "", RegexOptions.Compiled).Trim().ToLowerInvariant();
+//     string[] questionStarters = [
+//         "who ", "what ", "when ", "where ", "why ", "how ", "can ", "could ", "would ",
+//         "should ", "do ", "does ", "did ", "is ", "are ", "am ", "will ", "was ", "were "
+//     ];
 
-    return questionStarters.Any(normalized.StartsWith);
-}
+//     return questionStarters.Any(normalized.StartsWith);
+// }
 
-static bool LooksLikeSarcasm(string content) {
-    if(string.IsNullOrWhiteSpace(content)) {
-        return false;
-    }
+// static bool LooksLikeSarcasm(string content) {
+//     if(string.IsNullOrWhiteSpace(content)) {
+//         return false;
+//     }
 
-    var normalized = content.Trim().ToLowerInvariant();
-    if(normalized.Length < 8) {
-        return false;
-    }
+//     var normalized = content.Trim().ToLowerInvariant();
+//     if(normalized.Length < 8) {
+//         return false;
+//     }
 
-    string[] explicitMarkers = [
-        "/s", "sarcasm", "sarcastic", "yeah right", "sure jan", "as if",
-        "totally not", "what could possibly go wrong", "because that always works",
-        "love that for us", "shocking", "how surprising", "big brain",
-        "genius move", "great job", "nice work", "wonderful", "fantastic",
-        "amazing", "perfect", "brilliant", "obviously", "clearly"
-    ];
+//     string[] explicitMarkers = [
+//         "/s", "sarcasm", "sarcastic", "yeah right", "sure jan", "as if",
+//         "totally not", "what could possibly go wrong", "because that always works",
+//         "love that for us", "shocking", "how surprising", "big brain",
+//         "genius move", "great job", "nice work", "wonderful", "fantastic",
+//         "amazing", "perfect", "brilliant", "obviously", "clearly"
+//     ];
 
-    if(explicitMarkers.Any(marker => normalized.Contains(marker, StringComparison.OrdinalIgnoreCase))) {
-        return true;
-    }
+//     if(explicitMarkers.Any(marker => normalized.Contains(marker, StringComparison.OrdinalIgnoreCase))) {
+//         return true;
+//     }
 
-    string[] praiseWords = ["great", "nice", "perfect", "awesome", "amazing", "wonderful", "fantastic", "brilliant"];
-    string[] problemWords = ["again", "broken", "failed", "late", "crashed", "missing", "wrong", "terrible", "bad", "disaster"];
-    if(praiseWords.Any(normalized.Contains) && problemWords.Any(normalized.Contains)) {
-        return true;
-    }
+//     string[] praiseWords = ["great", "nice", "perfect", "awesome", "amazing", "wonderful", "fantastic", "brilliant"];
+//     string[] problemWords = ["again", "broken", "failed", "late", "crashed", "missing", "wrong", "terrible", "bad", "disaster"];
+//     if(praiseWords.Any(normalized.Contains) && problemWords.Any(normalized.Contains)) {
+//         return true;
+//     }
 
-    return Regex.IsMatch(normalized, @"\b(oh|wow|well)\s+(great|perfect|fantastic|wonderful|amazing)\b", RegexOptions.IgnoreCase);
-}
+//     return Regex.IsMatch(normalized, @"\b(oh|wow|well)\s+(great|perfect|fantastic|wonderful|amazing)\b", RegexOptions.IgnoreCase);
+// }
 
 static string FormatEggs(double amount) {
     string[] suffixes = ["", "K", "M", "B", "T", "q", "Q", "s", "S", "o", "N", "d", "U", "D"];
