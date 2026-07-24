@@ -10,6 +10,7 @@ appsettings.json
 **/appsettings.json
 data/
 **/data/
+backups/
 *.key
 *.bin
 

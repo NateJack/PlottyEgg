@@ -1,6 +1,6 @@
 # Plotty Egg Inc Discord Bot
 
-Plotty is a local Discord bot for an Egg Inc guild. It tracks registered player EIDs, pulls Egg Inc contract/co-op data, summarizes contribution rates, and provides staff tools plus a few pub-style community commands.
+Plotty is a local Discord bot for an Egg Inc guild. It tracks registered player EIDs, pulls Egg Inc contract/co-op data, summarizes contribution rates, and provides staff tools plus a few town-style community commands.
 
 The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 
@@ -28,6 +28,9 @@ The bot is written in C# on .NET 10 and uses Discord.Net plus Google.Protobuf.
 - `/contract` looks up a specific contract/co-op contribution report.
 - `/admin-rates-all` shows registered players grouped by contract from lowest to highest contribution.
 - `/admin-dashboard` shows staff overview data for registered players, low rates, sync issues, and likely unboosted players.
+- `/admin-list-members` compares Discord members with Plotty EID registrations, and can also compare against the EGG9000 guild roster API.
+- `/admin-e9k-compare` compares EGG9000 guild-tag members with live Discord server members.
+- `/admin-ping-unregistered` lets Staff send one custom message pinging members who have not registered with Plotty.
 - `/admin-health` privately shows Staff the last successful/failing check-ins for Plotty's background monitors.
 - `/admin-remove-late-notify` lets staff remove a member's active late notice for one contract or all contracts.
 - `/add-demerit` lets staff select a member and add active demerits.
@@ -41,17 +44,18 @@ Admin commands can be run in any channel, but only members with the `Staff` role
 
 ### Community Commands
 
-- `/beer-plotty` lets a member buy Plotty a beer, limited to once per hour.
-- `/beer-user` lets members gift beers to each other, limited to one gift per recipient per day.
-- `/beerleader` shows the Beer Leaderboard.
+- `/beverage-plotty` lets a member buy Plotty a beverage; beer and wine are limited to once per hour.
+- `/beverage-user` lets members gift beverages to each other, with an optional recipient ping; beer and wine are limited to once per hour.
+- `/beverage-leader` privately shows the Beverage Leaderboard.
 - `/plotty-mood` returns Plotty's mood as an emoji story plus a written translation.
 - `/plotty-excuses` returns an egg/chicken-themed excuse.
 - `/plotty-wisdom` returns random Plotty wisdom.
 
 ### Passive Chat Behavior
 
-- Plotty replies when mentioned.
-- If Plotty is asked a question by mention, it answers directly when possible; otherwise it gives a general answer and asks a follow-up question.
+- Plotty replies conversationally when mentioned and keeps a short, in-memory conversation with each user. Members can continue by replying directly to Plotty's message without mentioning it again.
+- Without an OpenAI key, Plotty uses a local no-key reply generator. With `OPENAI_API_KEY`, Plotty uses hosted AI-generated replies.
+- Chat redacts EIDs and API-key-looking text, does not receive Plotty's registration database, and hosted AI requests are marked not to be stored.
 - Plotty watches for `what the fox` and responds with a fox-themed reply.
 - Plotty watches for likely sarcastic remarks and responds.
 - Plotty keeps lightweight local personality memory from interactions, storing counters and timestamps only, then uses familiarity to vary future social replies.
@@ -82,13 +86,33 @@ Copy-Item src\EggContributionBot\appsettings.example.json src\EggContributionBot
     ]
   },
   "Storage": {
-    "DataPath": "data/egg-links.json",
+    "DataPath": "data/egg-links.db",
     "KeyPath": "data/eid-key.bin"
+  },
+  "Egg9000": {
+    "BaseUrl": "https://egg9000.com/",
+    "ApiKey": ""
+  },
+  "OpenAi": {
+    "BaseUrl": "https://api.openai.com/v1/",
+    "ApiKey": "",
+    "Model": "gpt-5-nano"
   }
 }
 ```
 
-Never commit `appsettings.json`, `data/`, logs, or build output. They are ignored by `.gitignore`.
+Prefer setting `EGG9000_API_KEY` as an environment variable instead of saving the API key in `appsettings.json`.
+Plotty can reply to mentions without an OpenAI key by using its local no-key conversation fallback. Set `OPENAI_API_KEY` as an environment variable only if you want hosted generated conversations. The default `gpt-5-nano` model minimizes token cost and can be changed in local settings when stronger conversation quality is more important.
+
+On Windows, securely save a new OpenAI API key for the current user without putting it in a project file:
+
+```powershell
+.\set-openai-key.ps1
+```
+
+Never commit `appsettings.json`, `data/`, `backups/`, logs, or build output. They are ignored by `.gitignore`.
+
+Plotty stores registrations and bot state in SQLite. On the first startup after upgrading from the older JSON store, it imports `data/egg-links.json` into `data/egg-links.db` exactly once. The original JSON file is retained as a local rollback copy and is no longer modified.
 
 ## Build
 
@@ -145,6 +169,7 @@ src/EggContributionBot/
     DataStore.cs
     EggWikiClient.cs
     MonitorHealthService.cs
+    PlottyAiClient.cs
     PlottyPersonality.cs
   EggIncClient.cs
   Program.cs

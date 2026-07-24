@@ -1,6 +1,5 @@
 using System.IO.Compression;
 using System.Net;
-using System.Net.Http.Headers;
 using EggContribBot.Proto;
 using Google.Protobuf;
 
@@ -17,6 +16,9 @@ public sealed class EggIncClient {
     private const string UserAgent = "egginc/1.35.7 CFNetwork/1410.1 Darwin/22.6.0";
 
     private readonly HttpClient _http;
+    private readonly SemaphoreSlim _currentContractsGate = new(1, 1);
+    private IReadOnlyList<Contract>? _currentContractsCache;
+    private DateTimeOffset _currentContractsCacheUntil;
 
     public EggIncClient(HttpClient? httpClient = null) {
         _http = httpClient ?? new HttpClient(new HttpClientHandler {
@@ -63,12 +65,9 @@ public sealed class EggIncClient {
         bool useCoopStatusHeaders,
         CancellationToken cancellationToken) {
         var payloadBase64 = Convert.ToBase64String(request.ToByteArray());
-        using var form = new FormUrlEncodedContent([
+        using var body = new FormUrlEncodedContent([
             new KeyValuePair<string, string>("data", payloadBase64)
         ]);
-        var body = new ByteArrayContent(await form.ReadAsByteArrayAsync(cancellationToken)) {
-            Headers = { ContentType = new MediaTypeHeaderValue("application/x-www-form-urlencoded") }
-        };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, path) { Content = body };
         if(useCoopStatusHeaders) {
@@ -95,6 +94,7 @@ public sealed class EggIncClient {
         } catch {
             return null;
         }
+        using var responseToDispose = response;
 
         if(!response.IsSuccessStatusCode) {
             return null;
@@ -130,29 +130,42 @@ public sealed class EggIncClient {
             : null;
     }
 
-    public async Task<(string ContractId, ContractCoopStatusResponse Status)?> FindCoopStatusAsync(
-        string coopCode,
-        CancellationToken cancellationToken = default) {
-        var contracts = await GetCurrentContractsAsync(cancellationToken);
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var candidates = contracts
-            .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
-            .Where(c => c.CoopAllowed)
-            .OrderByDescending(c => c.ExpirationTime > now)
-            .ThenByDescending(c => c.ExpirationTime)
-            .ToList();
-
-        foreach(var contract in candidates) {
-            var status = await GetCoopStatusAsync(contract.Identifier, coopCode, cancellationToken);
-            if(status is not null) {
-                return (contract.Identifier, status);
-            }
+    public async Task<Backup?> GetBackupAsync(string eggIncId, CancellationToken cancellationToken = default) {
+        var raw = await GetFirstContactBytesAsync(eggIncId, cancellationToken);
+        if(raw is null) {
+            return null;
         }
 
-        return null;
+        try {
+            var firstContact = EggIncFirstContactResponse.Parser.ParseFrom(raw);
+            return firstContact.Backup;
+        } catch(InvalidProtocolBufferException ex) {
+            Console.WriteLine($"Could not parse Egg Inc backup for EID hash {SecureText.Sha256(NormalizeEggId(eggIncId))[..8]}: {ex.Message}");
+            return null;
+        }
     }
 
-    public async Task<Backup?> GetBackupAsync(string eggIncId, CancellationToken cancellationToken = default) {
+    public async Task<EggIdValidationResult> ValidateEggIdAsync(string eggIncId, CancellationToken cancellationToken = default) {
+        var raw = await GetFirstContactBytesAsync(eggIncId, cancellationToken);
+        if(raw is null) {
+            return new EggIdValidationResult(false, null, false);
+        }
+
+        try {
+            var firstContact = EggIncFirstContactResponse.Parser.ParseFrom(raw);
+            return firstContact.Backup is null
+                ? new EggIdValidationResult(false, null, false)
+                : new EggIdValidationResult(true, firstContact.Backup.UserName, false);
+        } catch(InvalidProtocolBufferException ex) when(ex.Message.Contains("UTF-8", StringComparison.OrdinalIgnoreCase)) {
+            Console.WriteLine($"Validated EID with limited backup parsing for hash {SecureText.Sha256(NormalizeEggId(eggIncId))[..8]}: {ex.Message}");
+            return new EggIdValidationResult(true, null, true);
+        } catch(InvalidProtocolBufferException ex) {
+            Console.WriteLine($"Could not validate Egg Inc EID hash {SecureText.Sha256(NormalizeEggId(eggIncId))[..8]}: {ex.Message}");
+            return new EggIdValidationResult(false, null, false);
+        }
+    }
+
+    private async Task<byte[]?> GetFirstContactBytesAsync(string eggIncId, CancellationToken cancellationToken = default) {
         var normalized = NormalizeEggId(eggIncId);
         var request = new EggIncFirstContactRequest {
             ClientVersion = ClientVersion,
@@ -173,12 +186,9 @@ public sealed class EggIncClient {
         };
 
         var payloadBase64 = Convert.ToBase64String(request.ToByteArray());
-        using var form = new FormUrlEncodedContent([
+        using var body = new FormUrlEncodedContent([
             new KeyValuePair<string, string>("data", payloadBase64)
         ]);
-        var body = new ByteArrayContent(await form.ReadAsByteArrayAsync(cancellationToken)) {
-            Headers = { ContentType = new MediaTypeHeaderValue("application/x-www-form-urlencoded") }
-        };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, "ei/bot_first_contact") { Content = body };
         req.Headers.UserAgent.ParseAdd("Dalvik/2.1.0 (Linux; U; Android 9; SM-G960U1 Build/PPR1.180610.011)");
@@ -191,6 +201,7 @@ public sealed class EggIncClient {
         } catch {
             return null;
         }
+        using var responseToDispose = response;
 
         if(!response.IsSuccessStatusCode) {
             return null;
@@ -204,15 +215,7 @@ public sealed class EggIncClient {
             return null;
         }
 
-        var firstContact = EggIncFirstContactResponse.Parser.ParseFrom(raw);
-        return firstContact.Backup;
-    }
-
-    public async Task<IReadOnlyList<(string ContractId, string CoopCode, ContractCoopStatusResponse Status)>> GetPlayerCoopStatusesAsync(
-        string eggIncId,
-        CancellationToken cancellationToken = default) {
-        var lookup = await GetPlayerCoopLookupAsync(eggIncId, cancellationToken);
-        return lookup.Statuses;
+        return raw;
     }
 
     public async Task<PlayerCoopLookupResult> GetPlayerCoopLookupAsync(
@@ -241,6 +244,15 @@ public sealed class EggIncClient {
             .Concat(backup.Contracts.Archive)
             .Where(c => c is not null)
             .ToList();
+        var localContractsById = localContracts
+            .Where(c => !c.Cancelled)
+            .Select(c => (Contract: c, ContractId: GetContractId(c)))
+            .Where(c => !string.IsNullOrWhiteSpace(c.ContractId))
+            .GroupBy(c => c.ContractId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderByDescending(c => c.Contract.TimeAccepted).First().Contract,
+                StringComparer.OrdinalIgnoreCase);
 
         var candidates = new List<(string ContractId, string CoopCode, double AcceptedAt)>();
         var attemptedLookups = new List<string>();
@@ -250,11 +262,8 @@ public sealed class EggIncClient {
             .ToDictionary(g => g.Key, g => g.First());
 
         foreach(var farm in backup.Farms.Where(f => !string.IsNullOrWhiteSpace(f.ContractId))) {
-            var localContract = localContracts
-                .Where(c => !c.Cancelled)
-                .FirstOrDefault(c => string.Equals(GetContractId(c), farm.ContractId, StringComparison.OrdinalIgnoreCase));
-
-            if(localContract is not null && !string.IsNullOrWhiteSpace(localContract.CoopIdentifier)) {
+            if(localContractsById.TryGetValue(farm.ContractId, out var localContract) &&
+               !string.IsNullOrWhiteSpace(localContract.CoopIdentifier)) {
                 candidates.Add((farm.ContractId, localContract.CoopIdentifier, localContract.TimeAccepted));
             }
         }
@@ -273,26 +282,18 @@ public sealed class EggIncClient {
             .OrderByDescending(c => c.AcceptedAt)
             .ToList();
 
+        var lookupResults = await LookupCandidateStatusesAsync(candidates, embeddedStatuses, cancellationToken);
         var results = new List<(string ContractId, string CoopCode, ContractCoopStatusResponse Status)>();
         var statusLookups = new List<PlayerCoopStatusLookup>();
-        foreach(var candidate in candidates) {
-            if(embeddedStatuses.TryGetValue(
-                (candidate.ContractId.ToLowerInvariant(), candidate.CoopCode.ToLowerInvariant()),
-                out var embeddedStatus)) {
-                results.Add((candidate.ContractId, candidate.CoopCode, embeddedStatus));
-                statusLookups.Add(new PlayerCoopStatusLookup(candidate.ContractId, candidate.CoopCode, embeddedStatus, candidate.AcceptedAt));
-                attemptedLookups.Add($"{candidate.ContractId}/{candidate.CoopCode}: embedded");
+        foreach(var lookupResult in lookupResults) {
+            var candidate = lookupResult.Candidate;
+            attemptedLookups.Add(lookupResult.Attempt);
+            if(lookupResult.Status is null) {
                 continue;
             }
 
-            var status = await GetCoopStatusAsync(candidate.ContractId, candidate.CoopCode, cancellationToken);
-            if(status is not null) {
-                results.Add((candidate.ContractId, candidate.CoopCode, status));
-                statusLookups.Add(new PlayerCoopStatusLookup(candidate.ContractId, candidate.CoopCode, status, candidate.AcceptedAt));
-                attemptedLookups.Add($"{candidate.ContractId}/{candidate.CoopCode}: {status.ResponseStatus}");
-            } else {
-                attemptedLookups.Add($"{candidate.ContractId}/{candidate.CoopCode}: no response");
-            }
+            results.Add((candidate.ContractId, candidate.CoopCode, lookupResult.Status));
+            statusLookups.Add(new PlayerCoopStatusLookup(candidate.ContractId, candidate.CoopCode, lookupResult.Status, candidate.AcceptedAt));
         }
 
         return new PlayerCoopLookupResult(
@@ -333,7 +334,65 @@ public sealed class EggIncClient {
             ? contract.ContractIdentifier
             : contract.Contract?.Identifier ?? "";
 
+    private async Task<IReadOnlyList<CandidateStatusResult>> LookupCandidateStatusesAsync(
+        IReadOnlyList<(string ContractId, string CoopCode, double AcceptedAt)> candidates,
+        IReadOnlyDictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse> embeddedStatuses,
+        CancellationToken cancellationToken) {
+        if(candidates.Count == 0) {
+            return [];
+        }
+
+        using var gate = new SemaphoreSlim(4, 4);
+        var tasks = candidates.Select(async candidate => {
+            if(embeddedStatuses.TryGetValue(
+                (candidate.ContractId.ToLowerInvariant(), candidate.CoopCode.ToLowerInvariant()),
+                out var embeddedStatus)) {
+                return new CandidateStatusResult(
+                    candidate,
+                    embeddedStatus,
+                    $"{candidate.ContractId}/{candidate.CoopCode}: embedded");
+            }
+
+            await gate.WaitAsync(cancellationToken);
+            ContractCoopStatusResponse? status;
+            try {
+                status = await GetCoopStatusAsync(candidate.ContractId, candidate.CoopCode, cancellationToken);
+            } finally {
+                gate.Release();
+            }
+
+            return status is null
+                ? new CandidateStatusResult(candidate, null, $"{candidate.ContractId}/{candidate.CoopCode}: no response")
+                : new CandidateStatusResult(candidate, status, $"{candidate.ContractId}/{candidate.CoopCode}: {status.ResponseStatus}");
+        });
+
+        return await Task.WhenAll(tasks);
+    }
+
     public async Task<IReadOnlyList<Contract>> GetCurrentContractsAsync(CancellationToken cancellationToken = default) {
+        var now = DateTimeOffset.UtcNow;
+        if(_currentContractsCache is not null && _currentContractsCacheUntil > now) {
+            return _currentContractsCache;
+        }
+
+        await _currentContractsGate.WaitAsync(cancellationToken);
+        try {
+            now = DateTimeOffset.UtcNow;
+            if(_currentContractsCache is not null && _currentContractsCacheUntil > now) {
+                return _currentContractsCache;
+            }
+
+            _currentContractsCache = await FetchCurrentContractsAsync(cancellationToken);
+            _currentContractsCacheUntil = _currentContractsCache.Count == 0
+                ? now.AddSeconds(30)
+                : now.AddMinutes(5);
+            return _currentContractsCache;
+        } finally {
+            _currentContractsGate.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<Contract>> FetchCurrentContractsAsync(CancellationToken cancellationToken = default) {
         var request = new GetPeriodicalsRequest {
             UserId = PeriodicalsReferenceUserId,
             PiggyFull = false,
@@ -364,12 +423,9 @@ public sealed class EggIncClient {
         string userId,
         CancellationToken cancellationToken) where T : IMessage<T>, new() {
         var payloadBase64 = Convert.ToBase64String(message.ToByteArray());
-        using var form = new FormUrlEncodedContent([
+        using var body = new FormUrlEncodedContent([
             new KeyValuePair<string, string>("data", payloadBase64)
         ]);
-        var body = new ByteArrayContent(await form.ReadAsByteArrayAsync(cancellationToken)) {
-            Headers = { ContentType = new MediaTypeHeaderValue("application/x-www-form-urlencoded") }
-        };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, path) { Content = body };
         req.Headers.UserAgent.ParseAdd("egginc/1.26.1.3 CFNetwork/1335.0.3 Darwin/21.6.0");
@@ -382,6 +438,7 @@ public sealed class EggIncClient {
         } catch {
             return default;
         }
+        using var responseToDispose = response;
 
         if(!response.IsSuccessStatusCode) {
             return default;
@@ -413,6 +470,11 @@ public sealed class EggIncClient {
     }
 
     public static string NormalizeEggId(string eggIncId) => eggIncId.Trim().ToUpperInvariant();
+
+    private sealed record CandidateStatusResult(
+        (string ContractId, string CoopCode, double AcceptedAt) Candidate,
+        ContractCoopStatusResponse? Status,
+        string Attempt);
 }
 
 public sealed record PlayerCoopLookupResult(
@@ -436,3 +498,5 @@ public sealed record PlayerCoopStatusLookup(
     string CoopCode,
     ContractCoopStatusResponse Status,
     double AcceptedAt);
+
+public sealed record EggIdValidationResult(bool IsValid, string? EggName, bool BackupParseLimited);
