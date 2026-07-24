@@ -58,7 +58,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$eid", _secureText.Encrypt(normalized));
             Add(command, "$name", eggName);
             Add(command, "$updated", Date(DateTimeOffset.UtcNow));
-            await command.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(command);
         });
 
     public async Task<RegisteredEggAccount?> GetRegisteredAccountAsync(ulong guildId, ulong discordUserId) {
@@ -97,7 +97,7 @@ public sealed class DataStore : IDisposable {
                 "DELETE FROM registered_eids WHERE guild_id = $guild AND discord_user_id = $user;");
             Add(command, "$guild", Id(guildId));
             Add(command, "$user", Id(discordUserId));
-            return await command.ExecuteNonQueryAsync();
+            return await ExecuteNonQueryPreparedAsync(command);
         });
 
     public Task<int> AddDemeritsAsync(
@@ -152,7 +152,7 @@ public sealed class DataStore : IDisposable {
                 Add(exists, "$guild", Id(guildId));
                 Add(exists, "$source", candidate.SourceKey);
                 Add(exists, "$now", Date(now));
-                if(await exists.ExecuteScalarAsync() is not null) {
+                if(await ExecuteScalarPreparedAsync(exists) is not null) {
                     continue;
                 }
 
@@ -194,7 +194,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$user", Id(discordUserId));
             Add(command, "$now", Date(DateTimeOffset.UtcNow));
             Add(command, "$amount", Math.Max(1, amount));
-            return await command.ExecuteNonQueryAsync();
+            return await ExecuteNonQueryPreparedAsync(command);
         });
 
     public Task<IReadOnlyList<DemeritEntry>> GetActiveDemeritsAsync(ulong guildId, ulong? discordUserId = null) =>
@@ -213,7 +213,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$user", discordUserId is null ? null : Id(discordUserId.Value));
             Add(command, "$now", Date(DateTimeOffset.UtcNow));
             var result = new List<DemeritEntry>();
-            await using var reader = await command.ExecuteReaderAsync();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
             while(await reader.ReadAsync()) {
                 result.Add(ReadDemerit(reader));
             }
@@ -228,7 +228,7 @@ public sealed class DataStore : IDisposable {
             var now = DateTimeOffset.UtcNow;
             var cleanup = CreateCommand(connection, transaction, "DELETE FROM missing_join_alerts WHERE posted_at < $cutoff;");
             Add(cleanup, "$cutoff", Date(now.AddDays(-90)));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
             var command = CreateCommand(connection, transaction, """
                 INSERT INTO missing_join_alerts (key, posted_at)
@@ -237,7 +237,7 @@ public sealed class DataStore : IDisposable {
                 """);
             Add(command, "$key", key);
             Add(command, "$posted", Date(now));
-            await command.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(command);
         });
 
     public Task<bool> HasFirstCoopAwardAsync(string key) =>
@@ -247,7 +247,7 @@ public sealed class DataStore : IDisposable {
         WriteAsync(async (connection, transaction) => {
             var cleanup = CreateCommand(connection, transaction, "DELETE FROM first_coop_awards WHERE awarded_at < $cutoff;");
             Add(cleanup, "$cutoff", Date(DateTimeOffset.UtcNow.AddDays(-180)));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
             await InsertFirstCoopAwardAsync(connection, transaction, award);
         });
@@ -263,7 +263,7 @@ public sealed class DataStore : IDisposable {
             var cleanup = CreateCommand(connection, transaction,
                 "DELETE FROM weekly_token_leaderboard_posts WHERE posted_at < $cutoff;");
             Add(cleanup, "$cutoff", Date(DateTimeOffset.UtcNow.AddDays(-180)));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
             await InsertWeeklyTokenPostAsync(connection, transaction, post);
         });
@@ -289,7 +289,7 @@ public sealed class DataStore : IDisposable {
 
             var cleanup = CreateCommand(connection, transaction, "DELETE FROM contract_late_notices WHERE expires_at <= $now;");
             Add(cleanup, "$now", Date(now));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
             await InsertLateNoticeAsync(connection, transaction, notice);
             return notice;
         });
@@ -308,7 +308,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$now", Date(now));
             Add(command, "$contract", contractId);
             var result = new HashSet<ulong>();
-            await using var reader = await command.ExecuteReaderAsync();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
             while(await reader.ReadAsync()) {
                 result.Add(ParseId(reader.GetString(0)));
             }
@@ -329,11 +329,11 @@ public sealed class DataStore : IDisposable {
             Add(command, "$user", Id(discordUserId));
             Add(command, "$now", Date(now));
             Add(command, "$contract", string.IsNullOrWhiteSpace(contractId) ? null : contractId.Trim());
-            var removed = await command.ExecuteNonQueryAsync();
+            var removed = await ExecuteNonQueryPreparedAsync(command);
 
             var cleanup = CreateCommand(connection, transaction, "DELETE FROM contract_late_notices WHERE expires_at <= $now;");
             Add(cleanup, "$now", Date(now));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
             return removed;
         });
 
@@ -347,7 +347,7 @@ public sealed class DataStore : IDisposable {
                 """);
             Add(cleanup, "$notifiedCutoff", Date(now.AddDays(-7)));
             Add(cleanup, "$pendingCutoff", Date(now.AddDays(-2)));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
             await InsertShipNotificationAsync(connection, transaction, notification);
         });
 
@@ -363,7 +363,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$guild", Id(guildId));
             Add(command, "$now", Date(now));
             var result = new List<ShipReturnNotification>();
-            await using var reader = await command.ExecuteReaderAsync();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
             while(await reader.ReadAsync()) {
                 result.Add(new ShipReturnNotification(
                     ParseId(reader.GetString(0)),
@@ -384,7 +384,7 @@ public sealed class DataStore : IDisposable {
                 "UPDATE ship_return_notifications SET notified_at = $sent WHERE key = $key COLLATE NOCASE;");
             Add(command, "$sent", Date(sentAt));
             Add(command, "$key", key);
-            await command.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(command);
         });
 
     public Task<BeerAttemptResult> TryAddPlottyBeerAsync(
@@ -427,7 +427,7 @@ public sealed class DataStore : IDisposable {
             Add(giftCommand, "$guild", Id(guildId));
             Add(giftCommand, "$giver", Id(giverDiscordUserId));
             Add(giftCommand, "$recipient", Id(recipientDiscordUserId));
-            var lastGiftValue = await giftCommand.ExecuteScalarAsync();
+            var lastGiftValue = await ExecuteScalarPreparedAsync(giftCommand);
             var nextGiftAt = lastGiftValue is string value ? ParseDate(value).AddHours(1) : (DateTimeOffset?)null;
 
             var recipient = await GetBeerStatsAsync(connection, transaction, guildId, recipientDiscordUserId)
@@ -468,7 +468,7 @@ public sealed class DataStore : IDisposable {
             Add(log, "$giver", Id(giverDiscordUserId));
             Add(log, "$recipient", Id(recipientDiscordUserId));
             Add(log, "$gifted", Date(now));
-            await log.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(log);
             return new BeerAttemptResult(true, updatedRecipient, null);
         });
 
@@ -485,7 +485,7 @@ public sealed class DataStore : IDisposable {
                 """);
             Add(command, "$guild", Id(guildId));
             var result = new List<BeerStats>();
-            await using var reader = await command.ExecuteReaderAsync();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
             while(await reader.ReadAsync()) {
                 result.Add(ReadBeerStats(reader));
             }
@@ -527,7 +527,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$guild", Id(guildId));
             Add(command, "$user", Id(discordUserId));
             Add(command, "$cutoff", Date(DateTimeOffset.UtcNow.AddHours(-6)));
-            await using var reader = await command.ExecuteReaderAsync();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
             return await reader.ReadAsync() ? ReadConversation(reader) : null;
         });
 
@@ -539,7 +539,7 @@ public sealed class DataStore : IDisposable {
             var now = DateTimeOffset.UtcNow;
             var cleanup = CreateCommand(connection, transaction, "DELETE FROM plotty_conversations WHERE last_seen_at < $cutoff;");
             Add(cleanup, "$cutoff", Date(now.AddDays(-14)));
-            await cleanup.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
             var cleanTopic = string.IsNullOrWhiteSpace(topic) ? "chat" : topic.Trim();
             if(cleanTopic.Length > 80) {
@@ -554,7 +554,7 @@ public sealed class DataStore : IDisposable {
             Add(existing, "$guild", Id(guildId));
             Add(existing, "$user", Id(discordUserId));
             PlottyConversationState? current;
-            await using(var reader = await existing.ExecuteReaderAsync()) {
+            await using(var reader = await ExecuteReaderPreparedAsync(existing)) {
                 current = await reader.ReadAsync() ? ReadConversation(reader) : null;
             }
             current ??= new PlottyConversationState(guildId, discordUserId, cleanTopic, 0, now, now);
@@ -593,12 +593,12 @@ public sealed class DataStore : IDisposable {
             foreach(var parameter in parameters) {
                 Add(command, parameter.Name, parameter.Value);
             }
-            return await command.ExecuteScalarAsync() is not null;
+            return await ExecuteScalarPreparedAsync(command) is not null;
         });
 
     private async Task<IReadOnlyList<RegisteredEggAccount>> ReadAccountsAsync(SqliteCommand command) {
         var result = new List<RegisteredEggAccount>();
-        await using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await ExecuteReaderPreparedAsync(command);
         while(await reader.ReadAsync()) {
             result.Add(new RegisteredEggAccount(
                 ParseId(reader.GetString(0)),
@@ -647,12 +647,11 @@ public sealed class DataStore : IDisposable {
         }
 
         await using var connection = await OpenConnectionAsync();
-        var schema = CreateCommand(connection, null, SchemaSql);
-        await schema.ExecuteNonQueryAsync();
+        await ExecutePreparedStatementsAsync(connection, null, SchemaSql);
 
         var imported = CreateCommand(connection, null, "SELECT value FROM metadata WHERE key = $key;");
         Add(imported, "$key", LegacyImportKey);
-        if(await imported.ExecuteScalarAsync() is null) {
+        if(await ExecuteScalarPreparedAsync(imported) is null) {
             await ImportLegacyJsonAsync(connection);
         }
         _initialized = true;
@@ -680,7 +679,7 @@ public sealed class DataStore : IDisposable {
                 """);
             Add(command, "$key", entry.Key);
             Add(command, "$posted", Date(entry.PostedAt));
-            await command.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(command);
         }
         foreach(var entry in state.FirstCoopAwards) {
             await InsertFirstCoopAwardAsync(connection, transaction, entry);
@@ -707,7 +706,7 @@ public sealed class DataStore : IDisposable {
             Add(command, "$giver", Id(entry.GiverDiscordUserId));
             Add(command, "$recipient", Id(entry.RecipientDiscordUserId));
             Add(command, "$gifted", Date(entry.GiftedAt));
-            await command.ExecuteNonQueryAsync();
+            await ExecuteNonQueryPreparedAsync(command);
         }
         foreach(var entry in state.PlottyMemories) {
             await UpsertPlottyMemoryAsync(connection, transaction, entry);
@@ -722,16 +721,17 @@ public sealed class DataStore : IDisposable {
             """);
         Add(marker, "$key", LegacyImportKey);
         Add(marker, "$value", Date(DateTimeOffset.UtcNow));
-        await marker.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(marker);
         await transaction.CommitAsync();
     }
 
     private async Task<SqliteConnection> OpenConnectionAsync() {
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync();
-        var pragmas = connection.CreateCommand();
-        pragmas.CommandText = "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;";
-        await pragmas.ExecuteNonQueryAsync();
+        await ExecutePreparedStatementsAsync(
+            connection,
+            null,
+            "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
         return connection;
     }
 
@@ -755,7 +755,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$eid", entry.EncryptedEid);
         Add(command, "$name", entry.EggName);
         Add(command, "$updated", Date(entry.UpdatedAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task InsertDemeritAsync(
@@ -781,7 +781,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$created", Date(entry.CreatedAt));
         Add(command, "$expires", Date(entry.ExpiresAt));
         Add(command, "$removed", NullableDate(entry.RemovedAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task InsertFirstCoopAwardAsync(
@@ -799,7 +799,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$contract", award.ContractId);
         Add(command, "$coop", award.CoopCode);
         Add(command, "$awarded", Date(award.AwardedAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task InsertWeeklyTokenPostAsync(
@@ -814,7 +814,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$guild", Id(post.GuildId));
         Add(command, "$week", post.WeekKey);
         Add(command, "$posted", Date(post.PostedAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task InsertLateNoticeAsync(
@@ -840,7 +840,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$note", notice.Note);
         Add(command, "$created", Date(notice.CreatedAt));
         Add(command, "$expires", Date(notice.ExpiresAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task InsertShipNotificationAsync(
@@ -867,7 +867,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$return", Date(notification.ReturnAt));
         Add(command, "$created", Date(notification.CreatedAt));
         Add(command, "$notified", NullableDate(notification.NotifiedAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task<BeerStats?> GetBeerStatsAsync(
@@ -885,7 +885,7 @@ public sealed class DataStore : IDisposable {
             """);
         Add(command, "$guild", Id(guildId));
         Add(command, "$user", Id(discordUserId));
-        await using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await ExecuteReaderPreparedAsync(command);
         return await reader.ReadAsync() ? ReadBeerStats(reader) : null;
     }
 
@@ -937,7 +937,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$givenMembers", stats.BeersGivenToMembers);
         Add(command, "$lastReceived", NullableDate(stats.LastMemberBeerReceivedAt));
         Add(command, "$lastGiven", NullableDate(stats.LastMemberBeerGivenAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static async Task<PlottyMemory?> GetPlottyMemoryAsync(
@@ -954,7 +954,7 @@ public sealed class DataStore : IDisposable {
             """);
         Add(command, "$guild", Id(guildId));
         Add(command, "$user", Id(discordUserId));
-        await using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await ExecuteReaderPreparedAsync(command);
         return await reader.ReadAsync() ? ReadPlottyMemory(reader) : null;
     }
 
@@ -1014,7 +1014,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$wisdom", memory.WisdomRequests);
         Add(command, "$first", Date(memory.FirstSeenAt));
         Add(command, "$last", Date(memory.LastSeenAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static PlottyConversationState ReadConversation(SqliteDataReader reader) =>
@@ -1046,7 +1046,7 @@ public sealed class DataStore : IDisposable {
         Add(command, "$turns", conversation.Turns);
         Add(command, "$first", Date(conversation.FirstSeenAt));
         Add(command, "$last", Date(conversation.LastSeenAt));
-        await command.ExecuteNonQueryAsync();
+        await ExecuteNonQueryPreparedAsync(command);
     }
 
     private static DemeritEntry ReadDemerit(SqliteDataReader reader) =>
@@ -1075,6 +1075,33 @@ public sealed class DataStore : IDisposable {
 
     private static void Add(SqliteCommand command, string name, object? value) =>
         command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+
+    private static Task<int> ExecuteNonQueryPreparedAsync(SqliteCommand command) {
+        command.Prepare();
+        return command.ExecuteNonQueryAsync();
+    }
+
+    private static Task<object?> ExecuteScalarPreparedAsync(SqliteCommand command) {
+        command.Prepare();
+        return command.ExecuteScalarAsync();
+    }
+
+    private static Task<SqliteDataReader> ExecuteReaderPreparedAsync(SqliteCommand command) {
+        command.Prepare();
+        return command.ExecuteReaderAsync();
+    }
+
+    private static async Task ExecutePreparedStatementsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string sql) {
+        foreach(var statement in sql.Split(
+            ';',
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+            var command = CreateCommand(connection, transaction, statement);
+            await ExecuteNonQueryPreparedAsync(command);
+        }
+    }
 
     private static string Id(ulong value) => value.ToString(CultureInfo.InvariantCulture);
     private static ulong ParseId(string value) => ulong.Parse(value, CultureInfo.InvariantCulture);
