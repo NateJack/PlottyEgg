@@ -1,5 +1,7 @@
 using System.Text.Json;
 
+namespace EggContribBot.Config;
+
 public sealed record BotSettings(
     DiscordSettings Discord,
     StorageSettings Storage,

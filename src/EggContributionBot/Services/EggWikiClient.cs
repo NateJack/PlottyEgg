@@ -1,7 +1,9 @@
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using EggContribBot.Models;
 
+namespace EggContribBot.Services;
 public sealed class EggWikiClient {
     private const string ApiBase = "https://egg-inc.fandom.com/api.php";
     private static readonly HttpClient Http = new();

@@ -1,6 +1,7 @@
 using Discord;
 using EggContribBot.Proto;
-using EggContribBot;
+
+namespace EggContribBot.Models;
 
 public sealed record RegisteredEid(ulong GuildId, ulong DiscordUserId, string EidHash, string EncryptedEid, string? EggName, DateTimeOffset UpdatedAt);
 public sealed record RegisteredEggAccount(ulong DiscordUserId, string Eid, string? EggName, DateTimeOffset UpdatedAt) {

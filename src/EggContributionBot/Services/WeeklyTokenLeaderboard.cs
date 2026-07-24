@@ -1,5 +1,6 @@
 using EggContribBot.Proto;
 
+namespace EggContribBot.Services;
 public static class WeeklyTokenLeaderboard {
     public static TimeZoneInfo MountainTimeZone() {
         try {

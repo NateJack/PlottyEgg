@@ -3,7 +3,10 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using EggContribBot.Models;
+using EggContribBot.Config;
 
+namespace EggContribBot.Services;
 public sealed class PlottyAiClient {
     private const int MaxHistoryMessages = 10;
     private static readonly TimeSpan ConversationLifetime = TimeSpan.FromHours(6);

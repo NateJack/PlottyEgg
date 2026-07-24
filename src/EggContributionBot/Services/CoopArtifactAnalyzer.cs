@@ -1,6 +1,8 @@
 using System.Text.RegularExpressions;
-using EggContribBot;
 using EggContribBot.Proto;
+using EggContribBot.Models;
+
+namespace EggContribBot.Services;
 
 public static class CoopArtifactAnalyzer {
     public static CoopArtifactContext? Analyze(

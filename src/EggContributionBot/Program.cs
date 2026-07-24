@@ -7,6 +7,10 @@ using Discord;
 using Discord.WebSocket;
 using EggContribBot;
 using EggContribBot.Proto;
+using EggContribBot.Config;
+using EggContribBot.Services;
+using EggContribBot.Models;
+using EggContribBot.Commands;
 
 var settings = BotSettings.Load();
 var plottyAdminUserIds = settings.Discord.ParsedAdminUserIds.ToHashSet();
@@ -19,13 +23,15 @@ var dataStore = new DataStore(settings.Storage.DataPath, secureText);
 await dataStore.RemoveLegacyPlaintextLinksAsync();
 var eggClient = new EggIncClient();
 var egg9000Client = new Egg9000Client(settings.Egg9000);
-var wikiClient = new EggWikiClient();
 var plottyAiClient = new PlottyAiClient(settings.OpenAi);
 var monitorHealth = new MonitorHealthService();
 var missingJoinMonitorsStarted = new HashSet<ulong>();
 var shipReturnMonitorsStarted = new HashSet<ulong>();
 var firstCoopAwardMonitorsStarted = new HashSet<ulong>();
 var tokenLeaderboardMonitorsStarted = new HashSet<ulong>();
+var contractCommands = new ContractCommands(eggClient);
+var funCommands = new FunCommands(dataStore);
+
 const int MaxEggIncAccountConcurrency = 4;
 
 var client = new DiscordSocketClient(new DiscordSocketConfig {
@@ -95,7 +101,7 @@ client.SlashCommandExecuted += async command => {
 
         switch(command.CommandName) {
             case "contract":
-                await HandleContractAsync(command);
+                await contractCommands.HandleContractAsync(command);
                 break;
             case "contract-late-notify":
                 await HandleContractLateNotifyAsync(command);
@@ -178,8 +184,9 @@ client.SlashCommandExecuted += async command => {
             case "admin-plotty-speak":
                 await HandleAdminPlottySpeakAsync(command);
                 break;
-            case "help":
-                await HandleHelpAsync(command);
+            case "wiki":
+                // TODO: Simplify this command. It's nuts. This should just look stuff up on the Wiki.
+                await funCommands.HandleHelpAsync(command);
                 break;
         }
     } catch(Exception ex) {
@@ -449,7 +456,7 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
         .AddOption("message", ApplicationCommandOptionType.String, "What Plotty should say.", isRequired: true);
 
     yield return new SlashCommandBuilder()
-        .WithName("help")
+        .WithName("wiki")
         .WithDescription("Ask Plotty an Egg Inc question using the Egg Inc Wiki.")
         .AddOption("question", ApplicationCommandOptionType.String, "What do you want to know?", isRequired: true);
 
@@ -469,22 +476,6 @@ static SlashCommandOptionBuilder BuildBeverageChoiceOption() =>
         .AddChoice("Soda-Pop", "Soda-Pop")
         .AddChoice("Coffee", "Coffee")
         .AddChoice("Tea", "Tea");
-
-async Task HandleContractAsync(SocketSlashCommand command) {
-    await command.DeferAsync();
-
-    var contractId = GetString(command, "contract-id");
-    var coopCode = GetString(command, "coop-code");
-    var status = await eggClient.GetCoopStatusAsync(contractId, coopCode);
-
-    if(status is null) {
-        await command.FollowupAsync(
-            $"Couldn't find co-op `{coopCode}` for contract `{contractId}`. Double check both values.");
-        return;
-    }
-
-    await command.FollowupAsync(embed: BuildContributionEmbed(contractId, coopCode, status, showCoopCode: false));
-}
 
 async Task HandleContractLateNotifyAsync(SocketSlashCommand command) {
     var user = command.User as SocketGuildUser;
@@ -2236,221 +2227,6 @@ IMessageChannel? ResolveCachedInteractionMessageChannel(SocketSlashCommand comma
     return client.GetChannel(channelId) as IMessageChannel;
 }
 
-async Task HandleHelpAsync(SocketSlashCommand command) {
-    await command.DeferAsync();
-
-    var question = GetString(command, "question");
-    var personalAnswer = await TryBuildPersonalHelpAnswerAsync(command, question);
-    if(personalAnswer is not null) {
-        var personalEmbed = new EmbedBuilder()
-            .WithTitle(personalAnswer.Title)
-            .WithColor(Color.Purple)
-            .WithDescription(personalAnswer.Answer)
-            .AddField("Source", personalAnswer.Source)
-            .WithFooter("Plotty used your registered EID backup plus Egg Inc Wiki context.")
-            .WithCurrentTimestamp();
-
-        if(!string.IsNullOrWhiteSpace(personalAnswer.ImageUrl)) {
-            personalEmbed.WithThumbnailUrl(personalAnswer.ImageUrl);
-        }
-
-        await command.FollowupAsync(embed: personalEmbed.Build());
-        return;
-    }
-
-    var answer = await wikiClient.AnswerAsync(question);
-    if(answer is null) {
-        await command.FollowupAsync(
-            "Plotty could not find a good Egg Inc Wiki page for that. Try asking with a specific term like `prestige`, `contracts`, `artifacts`, or `boosts`.",
-            ephemeral: true);
-        return;
-    }
-
-    var embed = new EmbedBuilder()
-        .WithTitle($"Plotty Help - {answer.Title}")
-        .WithColor(Color.Blue)
-        .WithDescription(answer.Answer)
-        .AddField("Source", $"[Egg Inc Wiki: {answer.Title}]({answer.Url})")
-        .WithFooter("Answers come from the Egg Inc Wiki and may reflect community-maintained info.")
-        .WithCurrentTimestamp()
-        .Build();
-
-    await command.FollowupAsync(embed: embed);
-}
-
-async Task<PersonalHelpAnswer?> TryBuildPersonalHelpAnswerAsync(SocketSlashCommand command, string question) {
-    if(!LooksLikePersonalFarmerRankQuestion(question)) {
-        return null;
-    }
-
-    var accounts = await dataStore.GetRegisteredAccountsAsync(command.GuildId!.Value, command.User.Id);
-    var account = accounts.FirstOrDefault();
-    if(account is null) {
-        return new PersonalHelpAnswer(
-            "Plotty Help - Registered EID Needed",
-            "Plotty can answer personal PE/SE farmer-level questions after you run `/register-eid`.",
-            "Personal backup unavailable until an EID is registered.",
-            null);
-    }
-
-    var backup = await eggClient.GetBackupAsync(account.Eid);
-    if(backup?.Game is null) {
-        return new PersonalHelpAnswer(
-            "Plotty Help - Backup Unavailable",
-            "Plotty could not pull your Egg Inc backup right now. Please try again in a bit.",
-            "Egg Inc backup lookup failed.",
-            null);
-    }
-
-    return BuildFarmerRankHelpAnswer(backup);
-}
-
-static bool LooksLikePersonalFarmerRankQuestion(string question) {
-    var normalized = NormalizeName(question);
-    return (normalized.Contains("my") || normalized.Contains("me")) &&
-           (normalized.Contains("farmer") || normalized.Contains("level") || normalized.Contains("rank")) &&
-           (normalized.Contains("pe") || normalized.Contains("prophecy") || normalized.Contains("se") || normalized.Contains("soul"));
-}
-
-static PersonalHelpAnswer BuildFarmerRankHelpAnswer(Backup backup) {
-    var game = backup.Game;
-    var soulEggs = GetSoulEggs(game);
-    var unclaimedSoulEggs = GetUnclaimedSoulEggs(game);
-    var prophecyEggs = (double)game.EggsOfProphecy;
-    var unclaimedPe = game.UnclaimedEggsOfProphecy;
-    var soulFoodLevel = GetEpicResearchLevel(game, "soul_eggs");
-    var prophecyBonusLevel = GetEpicResearchLevel(game, "prophecy_bonus");
-    var soulEggBonus = soulFoodLevel + 10d;
-    var prophecyEggBonus = ((prophecyBonusLevel + 5d) / 100d) + 1d;
-    var earningsBonus = soulEggs * soulEggBonus * Math.Pow(prophecyEggBonus, prophecyEggs);
-    var currentRank = GetFarmerRank(earningsBonus);
-    var nextRank = GetFarmerRankByOom(Math.Min(currentRank.Oom + 1, 51));
-
-    if(currentRank.Oom >= 51) {
-        return new PersonalHelpAnswer(
-            "Plotty Help - Farmer Level",
-            $"You are already **{currentRank.Name}**.\n\n**SE:** {FormatEggs(soulEggs)}\n**PE:** {prophecyEggs:0}\n**Estimated EB:** {FormatEggs(earningsBonus)}%",
-            "[Egg Inc Wiki: Earnings Bonus](https://egg-inc.fandom.com/wiki/Earnings_Bonus)",
-            "https://egg-inc.fandom.com/wiki/Special:Redirect/file/Egg_of_Prophecy.png");
-    }
-
-    var targetEb = 100d * Math.Pow(10, nextRank.Oom);
-    var seNeededWithCurrentPe = Math.Max(0, targetEb / (soulEggBonus * Math.Pow(prophecyEggBonus, prophecyEggs)) - soulEggs);
-    var peOnlyNeeded = Enumerable.Range(0, 300)
-        .FirstOrDefault(extraPe => targetEb / (soulEggBonus * Math.Pow(prophecyEggBonus, prophecyEggs + extraPe)) <= soulEggs, -1);
-
-    var lines = new List<string> {
-        $"You are currently **{currentRank.Name}** and your next farmer level is **{nextRank.Name}**.",
-        "",
-        $"**Current SE:** {FormatEggs(soulEggs)}",
-        $"**Current PE:** {prophecyEggs:0}",
-        $"**Estimated EB:** {FormatEggs(earningsBonus)}%",
-        $"**Target EB:** {FormatEggs(targetEb)}%",
-        "",
-        $"With your current PE, you need about **{FormatEggs(seNeededWithCurrentPe)} more SE**."
-    };
-
-    if(peOnlyNeeded >= 0) {
-        lines.Add($"With no extra SE, you need about **{peOnlyNeeded} more PE**.");
-    } else {
-        lines.Add("With no extra SE, Plotty did not find a PE-only path within 300 additional PE.");
-    }
-
-    lines.Add("");
-    if(unclaimedSoulEggs > 0 || unclaimedPe > 0) {
-        lines.Add($"Unclaimed backup values not counted in active EB: `{FormatEggs(unclaimedSoulEggs)}` SE and `{unclaimedPe}` PE.");
-    }
-
-    lines.Add($"Plotty used Soul Food level `{soulFoodLevel}` and Prophecy Bonus level `{prophecyBonusLevel}` from your backup for this estimate.");
-
-    return new PersonalHelpAnswer(
-        "Plotty Help - Next Farmer Level",
-        string.Join("\n", lines),
-        "[Egg Inc Wiki: Earnings Bonus](https://egg-inc.fandom.com/wiki/Earnings_Bonus) and your registered EID backup",
-        "https://egg-inc.fandom.com/wiki/Special:Redirect/file/Egg_of_Prophecy.png");
-}
-
-static double GetSoulEggs(Backup.Types.Game game) {
-    return game.SoulEggsD > 0 ? game.SoulEggsD : game.SoulEggs;
-}
-
-static double GetUnclaimedSoulEggs(Backup.Types.Game game) {
-    return game.UnclaimedSoulEggsD > 0 ? game.UnclaimedSoulEggsD : game.UnclaimedSoulEggs;
-}
-
-static uint GetEpicResearchLevel(Backup.Types.Game game, string id) {
-    return game.EpicResearch
-        .FirstOrDefault(item => string.Equals(item.Id, id, StringComparison.OrdinalIgnoreCase))
-        ?.Level ?? 0;
-}
-
-static FarmerRankInfo GetFarmerRank(double earningsBonus) {
-    var oom = earningsBonus <= 0 ? 0 : (int)Math.Floor(Math.Log10(earningsBonus / 100d));
-    return GetFarmerRankByOom(oom);
-}
-
-static FarmerRankInfo GetFarmerRankByOom(int oom) {
-    var ranks = GetFarmerRanks();
-    var clamped = Math.Clamp(oom, 0, ranks.Length - 1);
-    return ranks[clamped];
-}
-
-static FarmerRankInfo[] GetFarmerRanks() {
-    return [
-        new(0, "Farmer"),
-        new(1, "Farmer II"),
-        new(2, "Farmer III"),
-        new(3, "Kilofarmer"),
-        new(4, "Kilofarmer II"),
-        new(5, "Kilofarmer III"),
-        new(6, "Megafarmer"),
-        new(7, "Megafarmer II"),
-        new(8, "Megafarmer III"),
-        new(9, "Gigafarmer"),
-        new(10, "Gigafarmer II"),
-        new(11, "Gigafarmer III"),
-        new(12, "Terafarmer"),
-        new(13, "Terafarmer II"),
-        new(14, "Terafarmer III"),
-        new(15, "Petafarmer"),
-        new(16, "Petafarmer II"),
-        new(17, "Petafarmer III"),
-        new(18, "Exafarmer"),
-        new(19, "Exafarmer II"),
-        new(20, "Exafarmer III"),
-        new(21, "Zettafarmer"),
-        new(22, "Zettafarmer II"),
-        new(23, "Zettafarmer III"),
-        new(24, "Yottafarmer"),
-        new(25, "Yottafarmer II"),
-        new(26, "Yottafarmer III"),
-        new(27, "Xennafarmer"),
-        new(28, "Xennafarmer II"),
-        new(29, "Xennafarmer III"),
-        new(30, "Weccafarmer"),
-        new(31, "Weccafarmer II"),
-        new(32, "Weccafarmer III"),
-        new(33, "Vendafarmer"),
-        new(34, "Vendafarmer II"),
-        new(35, "Vendafarmer III"),
-        new(36, "Uadafarmer"),
-        new(37, "Uadafarmer II"),
-        new(38, "Uadafarmer III"),
-        new(39, "Treidafarmer"),
-        new(40, "Treidafarmer II"),
-        new(41, "Treidafarmer III"),
-        new(42, "Quadafarmer"),
-        new(43, "Quadafarmer II"),
-        new(44, "Quadafarmer III"),
-        new(45, "Pendafarmer"),
-        new(46, "Pendafarmer II"),
-        new(47, "Pendafarmer III"),
-        new(48, "Exedafarmer"),
-        new(49, "Exedafarmer II"),
-        new(50, "Exedafarmer III"),
-        new(51, "Infinifarmer")
-    ];
-}
 
 Embed? BuildContributionEmbed(
     string contractId,

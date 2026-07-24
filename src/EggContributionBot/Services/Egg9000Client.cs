@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
+using EggContribBot.Models;
+using EggContribBot.Config;
 
-namespace EggContribBot;
+namespace EggContribBot.Services;
 
 public sealed class Egg9000Client {
     private readonly Egg9000Settings? _settings;

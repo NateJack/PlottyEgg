@@ -3,6 +3,9 @@ using EggContribBot.Proto;
 using Microsoft.Data.Sqlite;
 using System.Globalization;
 using System.Text.Json;
+using EggContribBot.Services;
+using EggContribBot.Models;
+using EggContribBot.Config;
 
 if(args is ["--audit-migration", var legacyJsonPath, var databasePath]) {
     await AuditMigrationAsync(legacyJsonPath, databasePath);

@@ -1,4 +1,5 @@
-
+namespace EggContribBot.Services;
+using EggContribBot.Models;
 public static class PlottyPersonality {
     private static readonly (string Emoji, string Story)[] Moods = [
         ("\U0001F305\U0001F95A\U0001F4C8\u2615\U0001F914\U0001F414\U0001F483\U0001F37A\U0001F319",

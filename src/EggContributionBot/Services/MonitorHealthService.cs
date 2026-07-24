@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 
+namespace EggContribBot.Services;
 public sealed record MonitorHealthSnapshot(
     string Name,
     ulong GuildId,

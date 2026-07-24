@@ -1,8 +1,10 @@
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using EggContribBot;
+using EggContribBot.Models;
 using Microsoft.Data.Sqlite;
+
+namespace EggContribBot.Services;
 
 public sealed class DataStore : IDisposable {
     private const string LegacyImportKey = "legacy_json_imported";
