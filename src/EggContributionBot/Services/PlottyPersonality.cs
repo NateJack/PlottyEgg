@@ -1,47 +1,5 @@
 
 public static class PlottyPersonality {
-    private static readonly string[] MentionReplies = [
-        "Plotty has been summoned and is pretending to look busy.",
-        "Plotty is here, carrying one clipboard and absolutely no certainty.",
-        "Plotty heard its name and arrived with suspicious confidence.",
-        "Plotty acknowledges the ping and offers one respectful nod.",
-        "Plotty is present, lightly caffeinated, and monitoring the egg economy.",
-        "Plotty has entered the chat with premium-grade confusion.",
-        "Plotty is listening. Plotty is also thinking about snacks.",
-        "Plotty reports for duty, probably.",
-        "Plotty appears with a clipboard and no promise that the clipboard helps.",
-        "Plotty has arrived wearing the emotional equivalent of a tiny vest.",
-        "Plotty heard the ping and immediately looked important.",
-        "Plotty is here, and the ledger is pretending this was scheduled.",
-        "Plotty accepts the summons with medium confidence and high posture.",
-        "Plotty has stepped out from behind the spreadsheet curtain.",
-        "Plotty is awake, mostly, which counts under guild policy.",
-        "Plotty heard its name and brought backup stationery.",
-        "Plotty has entered with the calm of a bot that did not read the room.",
-        "Plotty is present and willing to blame latency if needed.",
-        "Plotty has been perceived. The paperwork begins.",
-        "Plotty is here, carrying vibes, charts, and one questionable assumption.",
-        "Plotty responds from the administrative nest.",
-        "Plotty has joined the conversation and is standing near the snacks.",
-        "Plotty acknowledges this ping with theatrical seriousness.",
-        "Plotty arrives at a brisk ledger-approved pace.",
-        "Plotty is listening with both pixels.",
-        "Plotty heard the call and dusted off the response lever.",
-        "Plotty is here to help, hover, or make it weirder.",
-        "Plotty has surfaced from the data pond with a tiny nod."
-    ];
-
-    private static readonly string[] QuestionDiversions = [
-        "I can answer if I have enough context. Give me the contract, command, player detail, or Egg Inc term you mean.",
-        "I want to answer that directly. Add one more detail so I do not guess wrong.",
-        "I am listening. If this is about Egg Inc, name the mechanic or contract and I will use what I know.",
-        "I can work with that, but I need a sharper target before I give an answer.",
-        "I do not want to dodge it. Give me the missing piece and I will take a real swing.",
-        "I need a little more context to answer cleanly. What part should I focus on?",
-        "I can help with that if you point me at the command, player, contract, or artifact.",
-        "I am not sure which part you mean yet. Ask it one level more specifically and I will answer."
-    ];
-
     private static readonly (string Emoji, string Story)[] Moods = [
         ("\U0001F305\U0001F95A\U0001F4C8\u2615\U0001F914\U0001F414\U0001F483\U0001F37A\U0001F319",
             "Plotty woke up optimistic, checked the numbers, overthought one chicken, danced anyway, accepted a beer, and called it a productive day."),
@@ -148,7 +106,7 @@ public static class PlottyPersonality {
         "accepts the beer with a nod normally reserved for clean data.",
         "files this under `community support, liquid edition`.",
         "adds foam to the dashboard because metrics deserve texture.",
-        "thanks you. The pub ledger purrs softly.",
+        "thanks you. The town ledger purrs softly.",
         "sets the beer down exactly 2 pixels from the database.",
         "accepts the pint and briefly forgives all latency.",
         "declares this beverage operationally significant.",
@@ -173,7 +131,7 @@ public static class PlottyPersonality {
         "Plotty looked at the tab, looked at destiny, and bought you a beer.",
         "Plotty has issued one cold beverage from the emergency morale fund.",
         "Plotty bought you a beer and is now standing like this was heroic.",
-        "The pub algorithm smiled. Plotty bought you a beer.",
+        "The town algorithm smiled. Plotty bought you a beer.",
         "Plotty returns the favor with a beverage and suspicious ceremony.",
         "Plotty bought the round and quietly updated the legend column.",
         "Plotty has chosen generosity, which is cheaper than therapy.",
@@ -273,56 +231,13 @@ public static class PlottyPersonality {
         "Plotty is starting to recognize the shape of your chaos.",
         "Your ledger aura is becoming familiar.",
         "Plotty has upgraded you from `stranger` to `recurring subplot`.",
-        "The pub records are beginning to remember your stool.",
+        "The town records are beginning to remember your favorite corner.",
         "Plotty has a tiny footnote with your name on it.",
         "You are now a known variable in the social equation.",
         "Plotty's familiarity meter just made a polite clicking noise.",
         "The clipboard has stopped asking for your ID twice.",
         "Plotty recognizes your brand of excellent trouble.",
         "This is starting to feel like a recurring meeting with better snacks."
-    ];
-
-    private static readonly string[] ConversationGreetingLines = [
-        "Plotty is here and has put on the conversational clipboard.",
-        "Hello. Plotty is awake, socially calibrated, and only mildly over-indexed on eggs.",
-        "Plotty greets you with professional warmth and one tiny ledger flourish.",
-        "Hi. Plotty is listening with the seriousness of a spreadsheet at a pub.",
-        "Plotty has entered conversation mode. The tiny desk lamp is on."
-    ];
-
-    private static readonly string[] ConversationThankLines = [
-        "Plotty accepts the thanks and files it under `morale, precious`.",
-        "You are welcome. Plotty will now pretend not to glow slightly.",
-        "Plotty appreciates the appreciation. Very tidy. Very nourishing.",
-        "Anytime. Plotty lives for clean data and suspiciously kind words.",
-        "Plotty nods with all available pixels."
-    ];
-
-    private static readonly string[] ConversationLeadInLines = [
-        "Plotty can work with that. ",
-        "Ledger says: ",
-        "Short version from the clipboard: ",
-        "Plotty has a useful answer. ",
-        "Tiny desk lamp on. "
-    ];
-
-    private static readonly string[] UnknownQuestionReplies = [
-        "Generally, I would start by narrowing it to the goal, the current state, and what changed most recently. What part of it are you trying to decide or fix?",
-        "My broad answer is: check the simplest explanation first, then use the data to rule things out one at a time. What detail matters most here?",
-        "In general, I would compare what you expected to happen with what actually happened, then look for the first place they diverge. What are you seeing right now?",
-        "A good default is to make the next step small, reversible, and easy to verify. Are you asking about a command, a player, a contract, or something else?",
-        "Broadly speaking, I would treat it as a context problem: who is involved, what result do you want, and what information do we already have? Which of those should I focus on?",
-        "The general answer is to avoid guessing and work from the most reliable source available. Do you want me to reason from bot data, Egg Inc info, or guild rules?",
-        "If I am missing specifics, I would still start with the practical next action: identify the target, check the latest state, and decide what would confirm success. What is the target?",
-        "My general take is that the best answer depends on whether this is about performance, setup, fairness, or troubleshooting. Which lane is this in?"
-    ];
-
-    private static readonly string[] SmallTalkReplies = [
-        "I am following along. Give me a question and I will try to be useful instead of decorative.",
-        "I hear you. I can keep the conversation going if you give me the next thing you want to explore.",
-        "I can keep chatting. Ask me something specific and I will take a proper swing at it.",
-        "I am here for it. Tell me where you want to go next.",
-        "I have the thread. Keep going and I will follow the best I can."
     ];
 
     private static readonly string[] HumanSideNotes = [
@@ -336,9 +251,6 @@ public static class PlottyPersonality {
         "I can keep going from there."
     ];
 
-    public static string MentionResponse(string mention, bool isQuestion, PlottyMemory memory) =>
-        Speak($"{mention} {FamiliarAside(memory)}{Pick(isQuestion ? QuestionDiversions : MentionReplies)} {UniqueSpark(memory)}");
-
     public static string Mood(PlottyMemory memory) {
         var mood = Pick(Moods);
         return Speak($"**Emoji story**\n{mood.Emoji}\n\n**Translation**\n{FamiliarAside(memory)}{mood.Story} {UniqueSpark(memory)}");
@@ -351,19 +263,6 @@ public static class PlottyPersonality {
     public static string RegistrationWelcome(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(RegistrationWelcomes) + " " + UniqueSpark(memory));
     public static string SarcasmResponse(string mention, PlottyMemory memory) => Speak($"{mention} {FamiliarAside(memory)}{Pick(SarcasmReplies)} {UniqueSpark(memory)}");
     public static string FoxResponse(string mention, PlottyMemory memory) => Speak($"{mention} {FamiliarAside(memory)}{Pick(FoxReplies)} {UniqueSpark(memory)}");
-    public static string ConversationGreeting(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(ConversationGreetingLines) + " " + UniqueSpark(memory));
-    public static string ConversationThanks(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(ConversationThankLines) + " " + UniqueSpark(memory));
-    public static string ConversationLeadIn(PlottyMemory memory) => Speak(FamiliarAside(memory) + Pick(ConversationLeadInLines) + UniqueSpark(memory) + " ");
-    public static string ConversationUnknownQuestion(PlottyMemory memory, string? previousTopic) {
-        var previous = string.IsNullOrWhiteSpace(previousTopic)
-            ? ""
-            : $" Last thing Plotty remembers here was `{previousTopic}`.";
-        return Speak(FamiliarAside(memory) + Pick(UnknownQuestionReplies) + previous + " " + UniqueSpark(memory));
-    }
-
-    public static string ConversationSmallTalk(PlottyMemory memory, string topic) =>
-        Speak(FamiliarAside(memory) + Pick(SmallTalkReplies) + " " + UniqueSpark(memory));
-
     private static T Pick<T>(IReadOnlyList<T> values) =>
         values[Random.Shared.Next(values.Count)];
 
