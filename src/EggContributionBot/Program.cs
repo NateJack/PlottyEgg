@@ -7,6 +7,10 @@ using Discord;
 using Discord.WebSocket;
 using EggContribBot;
 using EggContribBot.Proto;
+using EggContribBot.Config;
+using EggContribBot.Services;
+using EggContribBot.Models;
+using EggContribBot.Commands;
 
 var settings = BotSettings.Load();
 var plottyAdminUserIds = settings.Discord.ParsedAdminUserIds.ToHashSet();
@@ -16,16 +20,28 @@ var token = settings.Discord.Token
 
 var secureText = new SecureText(settings.Storage.KeyPath);
 var dataStore = new DataStore(settings.Storage.DataPath, secureText);
+await dataStore.RemoveLegacyPlaintextLinksAsync();
 var eggClient = new EggIncClient();
-var wikiClient = new EggWikiClient();
+var egg9000Client = new Egg9000Client(settings.Egg9000);
+var plottyAiClient = new PlottyAiClient(settings.OpenAi);
 var monitorHealth = new MonitorHealthService();
 var missingJoinMonitorsStarted = new HashSet<ulong>();
 var shipReturnMonitorsStarted = new HashSet<ulong>();
+var firstCoopAwardMonitorsStarted = new HashSet<ulong>();
+var tokenLeaderboardMonitorsStarted = new HashSet<ulong>();
+var contractCommands = new ContractCommands(eggClient);
+var funCommands = new FunCommands(dataStore);
+
+const int MaxEggIncAccountConcurrency = 4;
 
 var client = new DiscordSocketClient(new DiscordSocketConfig {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMembers | GatewayIntents.GuildMessages | GatewayIntents.MessageContent,
     AlwaysDownloadUsers = true
 });
+
+Console.WriteLine(plottyAiClient.IsConfigured
+    ? $"Plotty AI chat is enabled with model {settings.OpenAi!.EffectiveModel}."
+    : "Plotty AI chat is using local no-key conversation replies. Set OPENAI_API_KEY to enable hosted generated replies.");
 
 client.Log += msg => {
     Console.WriteLine(msg.ToString());
@@ -52,10 +68,27 @@ client.Ready += async () => {
             if(shipReturnMonitorsStarted.Add(guildId)) {
                 _ = Task.Run(() => MonitorShipReturnsAsync(guildId));
             }
+            if(firstCoopAwardMonitorsStarted.Add(guildId)) {
+                _ = Task.Run(() => MonitorFirstCoopAwardsAsync(guildId));
+            }
+            if(tokenLeaderboardMonitorsStarted.Add(guildId)) {
+                _ = Task.Run(() => MonitorWeeklyTokenLeaderboardAsync(guildId));
+            }
         }
     } else {
         await client.Rest.BulkOverwriteGlobalCommands(commands);
         Console.WriteLine($"Logged in as {client.CurrentUser}; registered {commands.Length} global commands.");
+    }
+};
+
+client.UserLeft += async (guild, user) => {
+    try {
+        var removed = await dataStore.RemoveRegisteredEidsForUserAsync(guild.Id, user.Id);
+        if(removed > 0) {
+            Console.WriteLine($"Unregistered {removed} EID account(s) for {user.Username} ({user.Id}) after leaving {guild.Name}.");
+        }
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not unregister EIDs for departed user {user.Id} in guild {guild.Id}: {ex}");
     }
 };
 
@@ -68,7 +101,7 @@ client.SlashCommandExecuted += async command => {
 
         switch(command.CommandName) {
             case "contract":
-                await HandleContractAsync(command);
+                await contractCommands.HandleContractAsync(command);
                 break;
             case "contract-late-notify":
                 await HandleContractLateNotifyAsync(command);
@@ -85,8 +118,20 @@ client.SlashCommandExecuted += async command => {
             case "admin-rates-all":
                 await HandleRatesAllAsync(command);
                 break;
+            case "admin-member-contract":
+                await HandleAdminMemberContractAsync(command);
+                break;
             case "admin-dashboard":
                 await HandleDashboardAsync(command);
+                break;
+            case "admin-list-members":
+                await HandleAdminListMembersAsync(command);
+                break;
+            case "admin-e9k-compare":
+                await HandleAdminE9kCompareAsync(command);
+                break;
+            case "admin-ping-unregistered":
+                await HandleAdminPingUnregisteredAsync(command);
                 break;
             case "admin-health":
                 await HandleAdminHealthAsync(command);
@@ -115,14 +160,17 @@ client.SlashCommandExecuted += async command => {
             case "ships":
                 await HandleShipsAsync(command);
                 break;
-            case "beer-plotty":
+            case "beverage-plotty":
                 await HandleBeerPlottyAsync(command);
                 break;
-            case "beer-user":
+            case "beverage-user":
                 await HandleBeerUserAsync(command);
                 break;
-            case "beerleader":
+            case "beverage-leader":
                 await HandleBeerLeaderAsync(command);
+                break;
+            case "token-leaderboard":
+                await HandleTokenLeaderboardAsync(command);
                 break;
             case "plotty-mood":
                 await HandlePlottyMoodAsync(command);
@@ -136,8 +184,9 @@ client.SlashCommandExecuted += async command => {
             case "admin-plotty-speak":
                 await HandleAdminPlottySpeakAsync(command);
                 break;
-            case "help":
-                await HandleHelpAsync(command);
+            case "wiki":
+                // TODO: Simplify this command. It's nuts. This should just look stuff up on the Wiki.
+                await funCommands.HandleHelpAsync(command);
                 break;
         }
     } catch(Exception ex) {
@@ -163,21 +212,23 @@ client.ButtonExecuted += async component => {
                 return;
             }
 
+            await component.DeferAsync();
+
             var accounts = await dataStore.GetRegisteredAccountsAsync(component.GuildId.Value, discordUserId);
             if(accounts.Count == 0) {
-                await component.RespondAsync("That player does not have an EID registered anymore.", ephemeral: true);
+                await component.FollowupAsync("That player does not have an EID registered anymore.", ephemeral: true);
                 return;
             }
 
             var user = client.GetGuild(component.GuildId.Value)?.GetUser(discordUserId);
             var displayName = user?.DisplayName ?? accounts.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a.EggName))?.EggName ?? "Registered Player";
+            var lookups = await GetAccountCoopLookupsAsync(accounts.Take(10));
             var embeds = new List<Embed>();
-            foreach(var account in accounts.Take(10)) {
-                var backup = await eggClient.GetBackupAsync(account.Eid);
-                embeds.Add(await BuildPlayerEmbedAsync(account, displayName, backup));
+            foreach(var item in lookups) {
+                embeds.Add(await BuildPlayerEmbedAsync(item.Account, displayName, item.Lookup));
             }
 
-            await component.UpdateAsync(message => {
+            await component.ModifyOriginalResponseAsync(message => {
                 message.Embeds = embeds.ToArray();
                 message.Components = BuildPlayerComponents(discordUserId);
             });
@@ -220,36 +271,44 @@ client.MessageReceived += async message => {
             return;
         }
 
-        if(IsLateTodayChannel(guildChannel) && message.Author is SocketGuildUser lateUser) {
-            await HandleLateTodayMessageAsync(message, lateUser, guildChannel.Guild);
-            return;
-        }
-
-        if(message.MentionedUsers.Any(u => u.Id == client.CurrentUser.Id)) {
-            var prompt = StripBotMention(message.Content);
-            var isQuestion = LooksLikeQuestion(prompt);
-            var memory = await dataStore.RecordPlottyInteractionAsync(
-                guildChannel.Guild.Id,
-                message.Author.Id,
-                isQuestion ? "question_mention" : "mention");
-            var response = await BuildPlottyConversationResponseAsync(
-                guildChannel.Guild.Id,
-                message.Author.Id,
-                message.Author.Mention,
-                prompt,
-                isQuestion,
-                memory);
-            await message.Channel.SendMessageAsync(response, allowedMentions: AllowedMentions.None);
-            return;
-        }
-
         if(message.Content.Contains("what the fox", StringComparison.OrdinalIgnoreCase)) {
             var memory = await dataStore.RecordPlottyInteractionAsync(guildChannel.Guild.Id, message.Author.Id, "fox");
             await message.Channel.SendMessageAsync(PlottyPersonality.FoxResponse(message.Author.Mention, memory));
             return;
         }
 
-        if(LooksLikeSarcasm(message.Content) && Random.Shared.Next(3) == 0) {
+        if(IsLateTodayChannel(guildChannel) && message.Author is SocketGuildUser lateUser) {
+            await HandleLateTodayMessageAsync(message, lateUser, guildChannel.Guild);
+            return;
+        }
+
+        var mentionedPlotty = message.MentionedUsers.Any(u => u.Id == client.CurrentUser.Id);
+        var repliedToPlotty = false;
+        if(!mentionedPlotty && message.Reference?.MessageId.IsSpecified == true) {
+            var referencedMessage = await message.Channel.GetMessageAsync(message.Reference.MessageId.Value);
+            repliedToPlotty = referencedMessage?.Author.Id == client.CurrentUser.Id;
+        }
+
+        if(mentionedPlotty || repliedToPlotty) {
+            var prompt = StripBotMention(message.Content);
+            var isQuestion = LooksLikeQuestion(prompt);
+            var memory = await dataStore.RecordPlottyInteractionAsync(
+                guildChannel.Guild.Id,
+                message.Author.Id,
+                isQuestion ? "question_mention" : "mention");
+            var response = await plottyAiClient.GenerateReplyAsync(
+                guildChannel.Guild.Id,
+                message.Author.Id,
+                prompt,
+                memory);
+            var reply = response is null
+                ? $"{message.Author.Mention} I could not form a reply right now. Please try me again in a moment."
+                : $"{message.Author.Mention} {response}";
+            await message.Channel.SendMessageAsync(reply, allowedMentions: AllowedMentions.None);
+            return;
+        }
+
+        if(LooksLikeSarcasm(message.Content) && Random.Shared.Next(100) == 0) {
             var memory = await dataStore.RecordPlottyInteractionAsync(guildChannel.Guild.Id, message.Author.Id, "sarcasm");
             await message.Channel.SendMessageAsync(PlottyPersonality.SarcasmResponse(message.Author.Mention, memory));
         }
@@ -295,8 +354,26 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
         .WithDescription("Show all registered EID co-op rates from lowest to highest contribution.");
 
     yield return new SlashCommandBuilder()
+        .WithName("admin-member-contract")
+        .WithDescription("Staff only: privately show a member's active co-op players and rates.")
+        .AddOption("member", ApplicationCommandOptionType.User, "Discord member.", isRequired: true);
+
+    yield return new SlashCommandBuilder()
         .WithName("admin-dashboard")
         .WithDescription("Show a staff overview of registered players, low rates, sync issues, and likely unboosted players.");
+
+    yield return new SlashCommandBuilder()
+        .WithName("admin-list-members")
+        .WithDescription("Staff only: compare server members with Plotty EID registrations.");
+
+    yield return new SlashCommandBuilder()
+        .WithName("admin-e9k-compare")
+        .WithDescription("Staff only: compare EGG9000 guild-tag members with Discord server members.");
+
+    yield return new SlashCommandBuilder()
+        .WithName("admin-ping-unregistered")
+        .WithDescription("Staff only: ping every member who has not registered with Plotty.")
+        .AddOption("message", ApplicationCommandOptionType.String, "Message to include before the pings.", isRequired: true);
 
     yield return new SlashCommandBuilder()
         .WithName("admin-health")
@@ -342,17 +419,24 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
         .AddOption("notify", ApplicationCommandOptionType.Boolean, "DM you when the active ship returns.", isRequired: false);
 
     yield return new SlashCommandBuilder()
-        .WithName("beer-plotty")
-        .WithDescription("Buy Plotty a beer. Sometimes Plotty buys you one back.");
+        .WithName("beverage-plotty")
+        .WithDescription("Buy Plotty a beverage. Sometimes Plotty buys you one back.")
+        .AddOption(BuildBeverageChoiceOption());
 
     yield return new SlashCommandBuilder()
-        .WithName("beer-user")
-        .WithDescription("Gift another member a beer.")
-        .AddOption("member", ApplicationCommandOptionType.User, "Member receiving the beer.", isRequired: true);
+        .WithName("beverage-user")
+        .WithDescription("Gift another member a beverage.")
+        .AddOption("member", ApplicationCommandOptionType.User, "Member receiving the beverage.", isRequired: true)
+        .AddOption(BuildBeverageChoiceOption())
+        .AddOption("ping", ApplicationCommandOptionType.Boolean, "Ping the member receiving the beverage.", isRequired: false);
 
     yield return new SlashCommandBuilder()
-        .WithName("beerleader")
-        .WithDescription("Show the Beer Leaderboard.");
+        .WithName("beverage-leader")
+        .WithDescription("Privately show the Beverage Leaderboard.");
+
+    yield return new SlashCommandBuilder()
+        .WithName("token-leaderboard")
+        .WithDescription("Show this week's Tokie Awards for tokens sent.");
 
     yield return new SlashCommandBuilder()
         .WithName("plotty-mood")
@@ -372,27 +456,26 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
         .AddOption("message", ApplicationCommandOptionType.String, "What Plotty should say.", isRequired: true);
 
     yield return new SlashCommandBuilder()
-        .WithName("help")
+        .WithName("wiki")
         .WithDescription("Ask Plotty an Egg Inc question using the Egg Inc Wiki.")
         .AddOption("question", ApplicationCommandOptionType.String, "What do you want to know?", isRequired: true);
 
 }
 
-async Task HandleContractAsync(SocketSlashCommand command) {
-    await command.DeferAsync();
-
-    var contractId = GetString(command, "contract-id");
-    var coopCode = GetString(command, "coop-code");
-    var status = await eggClient.GetCoopStatusAsync(contractId, coopCode);
-
-    if(status is null) {
-        await command.FollowupAsync(
-            $"Couldn't find co-op `{coopCode}` for contract `{contractId}`. Double check both values.");
-        return;
-    }
-
-    await command.FollowupAsync(embed: BuildContributionEmbed(contractId, coopCode, status, showCoopCode: false));
-}
+static SlashCommandOptionBuilder BuildBeverageChoiceOption() =>
+    new SlashCommandOptionBuilder()
+        .WithName("drink")
+        .WithDescription("Which beverage?")
+        .WithType(ApplicationCommandOptionType.String)
+        .WithRequired(true)
+        .AddChoice("Water", "Water")
+        .AddChoice("LaCroix", "LaCroix")
+        .AddChoice("Milk", "Milk")
+        .AddChoice("Beer", "Beer")
+        .AddChoice("Wine", "Wine")
+        .AddChoice("Soda-Pop", "Soda-Pop")
+        .AddChoice("Coffee", "Coffee")
+        .AddChoice("Tea", "Tea");
 
 async Task HandleContractLateNotifyAsync(SocketSlashCommand command) {
     var user = command.User as SocketGuildUser;
@@ -408,53 +491,77 @@ async Task HandleContractLateNotifyAsync(SocketSlashCommand command) {
         note = note[..300];
     }
 
-    var (notice, staffChannel) = await RecordAndPostContractLateNoticeAsync(
+    var (notice, reportPosted) = await RecordAndPostContractLateNoticeAsync(
         command.GuildId!.Value,
         user,
         string.IsNullOrWhiteSpace(contractId) ? null : contractId,
         string.IsNullOrWhiteSpace(eta) ? null : eta,
         string.IsNullOrWhiteSpace(note) ? null : note);
     var contractText = string.IsNullOrWhiteSpace(notice.ContractId) ? "current contracts" : $"`{notice.ContractId}`";
-    var staffText = staffChannel is null ? " I could not find a Staff notice channel, but I saved the flag locally." : " I let Staff know without pinging them.";
-    await command.RespondAsync($"Got it. I marked you late for {contractText} for the next 48 hours, so you will not be added to the 6-hour non-join list while that flag is active.{staffText}", ephemeral: true);
+    var reportText = reportPosted ? " I created a thread in #plotty-reports without pinging anyone." : " I could not create a #plotty-reports thread, but I saved the flag locally.";
+    await command.RespondAsync($"Got it. I marked you late for {contractText} for the next 48 hours, so you will not be added to the 6-hour non-join list while that flag is active.{reportText}", ephemeral: true);
 }
 
 async Task HandleLateTodayMessageAsync(SocketMessage message, SocketGuildUser user, SocketGuild guild) {
     var contractId = ExtractLateNoticeContractId(message.Content);
     var note = TrimDiscordMessage(Regex.Replace(message.Content, @"\s+", " ").Trim(), 300);
-    var (notice, _) = await RecordAndPostContractLateNoticeAsync(
-        guild.Id,
-        user,
-        contractId,
-        eta: "late today",
-        note: string.IsNullOrWhiteSpace(note) ? null : note);
-    var contractText = string.IsNullOrWhiteSpace(notice.ContractId) ? "current contracts" : $"`{notice.ContractId}`";
+    var targets = string.IsNullOrWhiteSpace(contractId)
+        ? await GetLateTodayTargetContractsAsync()
+        : [(ContractId: contractId, ExpiresAt: (DateTimeOffset?)null)];
+    if(targets.Count == 0) {
+        await message.Channel.SendMessageAsync(
+            $"{user.Mention} I could not find the next upcoming contract yet. Please try `/contract-late-notify` with the contract id once it is available.",
+            allowedMentions: AllowedMentions.None);
+        return;
+    }
+
+    var notices = new List<ContractLateNotice>();
+    foreach(var target in targets) {
+        var (notice, _) = await RecordAndPostContractLateNoticeAsync(
+            guild.Id,
+            user,
+            target.ContractId,
+            eta: "late today",
+            note: string.IsNullOrWhiteSpace(note) ? null : note,
+            expiresAt: target.ExpiresAt);
+        notices.Add(notice);
+    }
+
+    var contractText = FormatLateNoticeContractList(notices
+        .Select(n => n.ContractId)
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Select(id => id!));
     await message.AddReactionAsync(new Emoji("✅"));
     await message.Channel.SendMessageAsync(
-        $"{user.Mention} got it. I marked you late for {contractText} for the next 48 hours.",
+        $"{user.Mention} got it. I marked you late for {contractText}.",
         allowedMentions: AllowedMentions.None);
 }
 
-async Task<(ContractLateNotice Notice, SocketTextChannel? StaffChannel)> RecordAndPostContractLateNoticeAsync(
+async Task<(ContractLateNotice Notice, bool ReportPosted)> RecordAndPostContractLateNoticeAsync(
     ulong guildId,
     SocketGuildUser user,
     string? contractId,
     string? eta,
-    string? note) {
+    string? note,
+    DateTimeOffset? expiresAt = null) {
     var notice = await dataStore.RecordContractLateNoticeAsync(
         guildId,
         user.Id,
         contractId,
         eta,
-        note);
+        note,
+        expiresAt);
 
     var guild = client.GetGuild(guildId);
-    var staffChannel = guild is null ? null : FindStaffNoticeChannel(guild);
-    if(staffChannel is not null) {
-        await staffChannel.SendMessageAsync(embed: BuildContractLateNoticeEmbed(user, notice), allowedMentions: AllowedMentions.None);
-    }
+    var reportChannel = guild is null ? null : FindPlottyReportsChannel(guild);
+    var reportPosted = reportChannel is not null &&
+        await TryPostReportThreadAsync(
+            reportChannel,
+            $"Late notice - {user.DisplayName}",
+            BuildContractLateNoticeEmbed(user, notice),
+            "plotty-reports");
 
-    return (notice, staffChannel);
+    return (notice, reportPosted);
 }
 
 Embed BuildContractLateNoticeEmbed(SocketGuildUser user, ContractLateNotice notice) {
@@ -477,6 +584,79 @@ Embed BuildContractLateNoticeEmbed(SocketGuildUser user, ContractLateNotice noti
     }
 
     return builder.Build();
+}
+
+async Task<IReadOnlyList<(string ContractId, DateTimeOffset? ExpiresAt)>> GetLateTodayTargetContractsAsync() {
+    var now = DateTimeOffset.UtcNow;
+    var upcomingContracts = (await eggClient.GetCurrentContractsAsync())
+        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
+        .Where(c => c.CoopAllowed)
+        .Where(c => c.StartTime > 0)
+        .Select(c => new {
+            Contract = c,
+            StartsAt = DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime)
+        })
+        .Where(c => c.StartsAt >= now.AddHours(-6))
+        .OrderBy(c => c.StartsAt)
+        .ThenBy(c => c.Contract.CcOnly)
+        .ToList();
+    if(upcomingContracts.Count == 0) {
+        return [];
+    }
+
+    var next = upcomingContracts.FirstOrDefault(c => c.StartsAt >= now) ?? upcomingContracts.First();
+    var localNow = ToGuildLocalTime(now);
+    var localReleaseDate = ToGuildLocalTime(next.StartsAt).Date;
+    var selectedContracts = localNow.DayOfWeek == DayOfWeek.Friday
+        ? upcomingContracts
+            .Where(c => ToGuildLocalTime(c.StartsAt).Date == localReleaseDate)
+            .GroupBy(c => c.Contract.Identifier, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.OrderBy(c => c.StartsAt).First())
+            .ToList()
+        : [next];
+
+    return selectedContracts
+        .Select(c => (
+            ContractId: c.Contract.Identifier,
+            ExpiresAt: (DateTimeOffset?)ContractLateNoticeExpiresAt(c.Contract, c.StartsAt)))
+        .ToList();
+}
+
+static DateTimeOffset ContractLateNoticeExpiresAt(Contract contract, DateTimeOffset startsAt) {
+    if(contract.ExpirationTime > 0) {
+        return DateTimeOffset.FromUnixTimeSeconds((long)contract.ExpirationTime);
+    }
+
+    if(contract.LengthSeconds > 0) {
+        return startsAt.AddSeconds(contract.LengthSeconds);
+    }
+
+    return startsAt.AddDays(7);
+}
+
+static string FormatLateNoticeContractList(IEnumerable<string> contractIds) {
+    var ids = contractIds
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Select(id => $"`{id}`")
+        .ToList();
+    return ids.Count switch {
+        0 => "the next upcoming contract",
+        1 => ids[0],
+        2 => $"{ids[0]} and {ids[1]}",
+        _ => string.Join(", ", ids.Take(ids.Count - 1)) + $", and {ids[^1]}"
+    };
+}
+
+static DateTimeOffset ToGuildLocalTime(DateTimeOffset value) {
+    try {
+        var mountain = TimeZoneInfo.FindSystemTimeZoneById("Mountain Standard Time");
+        return TimeZoneInfo.ConvertTime(value, mountain);
+    } catch(TimeZoneNotFoundException) {
+        return value.ToLocalTime();
+    } catch(InvalidTimeZoneException) {
+        return value.ToLocalTime();
+    }
 }
 
 async Task HandleAdminRemoveLateNotifyAsync(SocketSlashCommand command) {
@@ -509,12 +689,16 @@ async Task HandleRegisteredRatesAsync(SocketSlashCommand command) {
         return;
     }
 
+    var lookups = await GetAccountCoopLookupsAsync(accounts);
     var runningEmbeds = new List<Embed>();
     var completedEmbeds = new List<Embed>();
     var diagnostics = new List<string>();
-    foreach(var account in accounts) {
-        var lookup = await eggClient.GetPlayerCoopLookupAsync(account.Eid);
+    var completedContractCount = 0;
+    foreach(var item in lookups) {
+        var account = item.Account;
+        var lookup = item.Lookup;
         var accountLabel = AccountDisplayName(account);
+        completedContractCount += CountCompletedContracts(lookup.Backup);
         runningEmbeds.AddRange(lookup.Statuses
             .Select(s => BuildContributionEmbed(s.ContractId, s.CoopCode, s.Status, showCoopCode: false, titleSuffix: $"(running - {accountLabel})"))
             .Where(e => e is not null)
@@ -535,12 +719,42 @@ async Task HandleRegisteredRatesAsync(SocketSlashCommand command) {
         return;
     }
 
-    var summary = $"Showing `{runningEmbeds.Count}` running contract(s) and `{completedEmbeds.Count}` completed contract(s) from `{accounts.Count}` registered EID account(s).";
+    var summary = $"Showing `{runningEmbeds.Count}` running contract(s) and `{completedContractCount}` completed contract(s) from `{accounts.Count}` registered EID account(s).";
     for(var i = 0; i < embeds.Count; i += 10) {
         var batch = embeds.Skip(i).Take(10).ToArray();
         await command.FollowupAsync(text: i == 0 ? summary : null, embeds: batch, ephemeral: true);
     }
 }
+
+static int CountCompletedContracts(Backup? backup) {
+    if(backup?.Contracts is null) {
+        return 0;
+    }
+
+    var detailedCompletedCount = backup.Contracts.Archive
+        .Concat(backup.Contracts.Contracts.Where(IsCompletedLocalContract))
+        .Where(c => !c.Cancelled)
+        .Select(c => new PlayerContractCandidate(GetLocalContractId(c), c.CoopIdentifier, c.TimeAccepted))
+        .Where(c => !string.IsNullOrWhiteSpace(c.ContractId))
+        .GroupBy(c => (
+            ContractId: c.ContractId.ToLowerInvariant(),
+            CoopCode: string.IsNullOrWhiteSpace(c.CoopCode) ? "" : c.CoopCode.ToLowerInvariant()))
+        .Count();
+
+    var seenContractCount = backup.Contracts.ContractIdsSeen
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Count();
+
+    return Math.Max(detailedCompletedCount, seenContractCount);
+}
+
+static bool IsCompletedLocalContract(LocalContract contract) =>
+    contract.Accepted &&
+    !contract.Cancelled &&
+    (contract.CoopContributionFinalized ||
+     contract.NumGoalsAchieved > 0 ||
+     contract.LastAmountWhenRewardGiven > 0);
 
 async Task<IReadOnlyList<Embed>> BuildRecentCompletedRateEmbedsAsync(
     RegisteredEggAccount account,
@@ -564,10 +778,15 @@ async Task<IReadOnlyList<Embed>> BuildRecentCompletedRateEmbedsAsync(
         .Take(2)
         .ToList();
 
-    var embeds = new List<Embed>();
     var accountLabel = AccountDisplayName(account);
-    foreach(var contract in completedContracts) {
-        var status = await eggClient.GetCoopStatusAsync(contract.ContractId, contract.CoopCode);
+    var statuses = await SelectWithConcurrencyAsync(
+        completedContracts,
+        MaxEggIncAccountConcurrency,
+        async contract => (Contract: contract, Status: await eggClient.GetCoopStatusAsync(contract.ContractId, contract.CoopCode)));
+    var embeds = new List<Embed>();
+    foreach(var item in statuses) {
+        var contract = item.Contract;
+        var status = item.Status;
         var embed = status is null
             ? null
             : BuildContributionEmbed(contract.ContractId, contract.CoopCode, status, showCoopCode: false, titleSuffix: $"(completed - {accountLabel})");
@@ -586,7 +805,7 @@ async Task HandleRatesAllAsync(SocketSlashCommand command) {
         return;
     }
 
-    await command.DeferAsync();
+    await command.DeferAsync(ephemeral: true);
 
     var accounts = await dataStore.GetRegisteredEidsAsync(command.GuildId!.Value);
     if(accounts.Count == 0) {
@@ -601,57 +820,20 @@ async Task HandleRatesAllAsync(SocketSlashCommand command) {
         .Select(a => NormalizeName(a.EggName))
         .Where(n => n.Length > 0)
         .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    var registeredByEggId = accounts
-        .Where(a => !string.IsNullOrWhiteSpace(a.Eid))
-        .GroupBy(a => EggIncClient.NormalizeEggId(a.Eid), StringComparer.OrdinalIgnoreCase)
-        .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
-    var registeredByName = accounts
-        .Where(a => NormalizeName(a.EggName).Length > 0)
-        .GroupBy(a => NormalizeName(a.EggName), StringComparer.OrdinalIgnoreCase)
-        .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
-
-    var now = DateTimeOffset.UtcNow;
-    var recentContractIds = (await eggClient.GetCurrentContractsAsync())
-        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
-        .Where(c => c.StartTime > 0)
-        .Where(c => DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime) >= now.AddDays(-3))
-        .Where(c => c.ExpirationTime <= 0 || DateTimeOffset.FromUnixTimeSeconds((long)c.ExpirationTime) > now)
-        .Select(c => c.Identifier)
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    if(recentContractIds.Count == 0) {
+    var statusResult = await GetRecentRegisteredStatusesAsync(accounts);
+    if(statusResult.RecentContractCount == 0) {
         await command.FollowupAsync("I could not find any active contracts released in the past 3 days.", ephemeral: true);
         return;
     }
 
-    var statuses = new Dictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse>();
-    var failed = 0;
-    var skippedOldContracts = 0;
-    foreach(var account in accounts) {
-        var lookup = await eggClient.GetPlayerCoopLookupAsync(account.Eid);
-        if(lookup.Statuses.Count == 0) {
-            failed++;
-            continue;
-        }
-
-        foreach(var status in lookup.Statuses) {
-            if(!recentContractIds.Contains(status.ContractId)) {
-                skippedOldContracts++;
-                continue;
-            }
-
-            var key = (status.ContractId.ToLowerInvariant(), status.CoopCode.ToLowerInvariant());
-            statuses.TryAdd(key, status.Status);
-        }
-    }
-
-    if(statuses.Count == 0) {
+    if(statusResult.Statuses.Count == 0) {
         await command.FollowupAsync(
             $"I checked `{accounts.Count}` registered EID(s), but none had active co-op rates for contracts released in the past 3 days.",
             ephemeral: true);
         return;
     }
 
-    var embeds = statuses.Values
+    var embeds = statusResult.Statuses.Values
         .GroupBy(s => string.IsNullOrWhiteSpace(s.ContractIdentifier)
             ? "(unknown contract)"
             : s.ContractIdentifier,
@@ -665,23 +847,78 @@ async Task HandleRatesAllAsync(SocketSlashCommand command) {
 
     if(embeds.Length == 0) {
         await command.FollowupAsync(
-            $"Plotty found `{statuses.Count}` active co-op(s), but none of their contributors matched a registered EID or registered Egg Inc name.",
+            $"Plotty found `{statusResult.Statuses.Count}` active co-op(s), but none of their contributors matched a registered EID or registered Egg Inc name.",
             ephemeral: true);
         return;
     }
 
-    var message = failed > 0
-        ? $"Showing registered EID players only for contracts released in the past 3 days. `{failed}` registered EID(s) did not return active rates."
+    var message = statusResult.Failed > 0
+        ? $"Showing registered EID players only for contracts released in the past 3 days. `{statusResult.Failed}` registered EID(s) did not return active rates."
         : $"Showing registered EID players only for contracts released in the past 3 days from `{accounts.Count}` registered EID(s).";
-    if(skippedOldContracts > 0) {
-        message += $" Skipped `{skippedOldContracts}` older active co-op lookup(s).";
+    if(statusResult.SkippedOldContracts > 0) {
+        message += $" Skipped `{statusResult.SkippedOldContracts}` older active co-op lookup(s).";
     }
 
-    await command.FollowupAsync(text: message, embeds: embeds);
+    await command.FollowupAsync(text: message, embeds: embeds, ephemeral: true);
+}
+
+async Task HandleAdminMemberContractAsync(SocketSlashCommand command) {
+    var staffUser = command.User as SocketGuildUser;
+    if(staffUser is null || !HasStaffRole(staffUser)) {
+        await command.RespondAsync("Only members with the Staff role can view member contracts.", ephemeral: true);
+        return;
+    }
+
+    var member = ResolveGuildMemberOption(command, "member");
+    if(member is null) {
+        await command.RespondAsync("I can only look up members in this server.", ephemeral: true);
+        return;
+    }
+
+    await command.DeferAsync(ephemeral: true);
+
+    var accounts = await dataStore.GetRegisteredAccountsAsync(command.GuildId!.Value, member.Id);
+    if(accounts.Count == 0) {
+        await command.FollowupAsync($"{member.DisplayName} does not have an EID registered with Plotty.", ephemeral: true);
+        return;
+    }
+
+    var lookups = await GetAccountCoopLookupsAsync(accounts);
+    var embeds = new List<Embed>();
+    var diagnostics = new List<string>();
+    foreach(var item in lookups) {
+        var account = item.Account;
+        var lookup = item.Lookup;
+        var accountLabel = AccountDisplayName(account);
+        embeds.AddRange(lookup.Statuses
+            .Select(s => BuildContributionEmbed(
+                s.ContractId,
+                s.CoopCode,
+                s.Status,
+                showCoopCode: false,
+                titleSuffix: accounts.Count > 1 ? $"({member.DisplayName} - {accountLabel})" : $"({member.DisplayName})"))
+            .Where(e => e is not null)
+            .Cast<Embed>());
+
+        if(lookup.Statuses.Count == 0) {
+            diagnostics.Add($"**{accountLabel}**\n{BuildCoopLookupDiagnostic(lookup)}");
+        }
+    }
+
+    if(embeds.Count == 0) {
+        var details = diagnostics.Count == 0 ? "" : "\n\n" + string.Join("\n\n", diagnostics.Take(3));
+        await command.FollowupAsync(
+            $"I could not find an active co-op for {member.DisplayName}'s registered EID account(s).{details}",
+            ephemeral: true);
+        return;
+    }
+
+    var summary = $"Showing `{embeds.Count}` active co-op contract(s) for {member.DisplayName} across `{accounts.Count}` registered EID account(s).";
+    await SendPrivateEmbedReportAsync(command, summary, embeds);
 }
 
 async Task HandlePlayerAsync(SocketSlashCommand command) {
-    await command.DeferAsync();
+    await command.DeferAsync(ephemeral: true);
 
     var member = command.Data.Options.FirstOrDefault(o => o.Name == "member")?.Value as SocketGuildUser;
     var discordUserId = member?.Id ?? command.User.Id;
@@ -695,16 +932,17 @@ async Task HandlePlayerAsync(SocketSlashCommand command) {
         return;
     }
 
+    var lookups = await GetAccountCoopLookupsAsync(accounts.Take(10));
     var embeds = new List<Embed>();
-    foreach(var account in accounts.Take(10)) {
-        var backup = await eggClient.GetBackupAsync(account.Eid);
-        embeds.Add(await BuildPlayerEmbedAsync(account, displayName, backup));
+    foreach(var item in lookups) {
+        embeds.Add(await BuildPlayerEmbedAsync(item.Account, displayName, item.Lookup));
     }
 
     await command.FollowupAsync(
         text: accounts.Count > 1 ? $"Showing `{embeds.Count}` Egg Inc account(s) tied to {displayName}." : null,
         embeds: embeds.ToArray(),
-        components: BuildPlayerComponents(discordUserId));
+        components: BuildPlayerComponents(discordUserId),
+        ephemeral: true);
 }
 
 async Task HandleDashboardAsync(SocketSlashCommand command) {
@@ -714,7 +952,7 @@ async Task HandleDashboardAsync(SocketSlashCommand command) {
         return;
     }
 
-    await command.DeferAsync();
+    await command.DeferAsync(ephemeral: true);
 
     var dashboard = await BuildDashboardAsync(command.GuildId!.Value);
     if(dashboard.Embeds.Count == 0) {
@@ -722,7 +960,7 @@ async Task HandleDashboardAsync(SocketSlashCommand command) {
         return;
     }
 
-    await command.FollowupAsync(text: dashboard.Message, embeds: dashboard.Embeds.ToArray(), components: BuildDashboardComponents());
+    await command.FollowupAsync(text: dashboard.Message, embeds: dashboard.Embeds.ToArray(), components: BuildDashboardComponents(), ephemeral: true);
 }
 
 async Task HandleDashboardButtonAsync(SocketMessageComponent component) {
@@ -759,6 +997,203 @@ async Task HandleDashboardButtonAsync(SocketMessageComponent component) {
             await component.FollowupAsync(BuildDashboardFullList(dashboard.Rows), ephemeral: true);
             break;
 
+    }
+}
+
+async Task HandleAdminListMembersAsync(SocketSlashCommand command) {
+    var staffUser = command.User as SocketGuildUser;
+    if(staffUser is null || !HasStaffRole(staffUser)) {
+        await command.RespondAsync("Only members with the Staff role can list registered members.", ephemeral: true);
+        return;
+    }
+
+    await command.DeferAsync(ephemeral: true);
+
+    var guild = client.GetGuild(command.GuildId!.Value);
+    if(guild is null) {
+        await command.FollowupAsync("I could not read this server's member list.", ephemeral: true);
+        return;
+    }
+
+    try {
+        await guild.DownloadUsersAsync();
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not refresh guild users for admin-list-members: {ex.Message}");
+    }
+
+    var registeredAccounts = await dataStore.GetRegisteredEidsAsync(guild.Id);
+    var registeredByUser = registeredAccounts
+        .GroupBy(a => a.DiscordUserId)
+        .ToDictionary(g => g.Key, g => g.ToList());
+    var members = guild.Users
+        .Where(u => !u.IsBot)
+        .OrderBy(DiscordAccountSortName, StringComparer.OrdinalIgnoreCase)
+        .ThenBy(u => u.Id)
+        .ToList();
+    var registeredMembers = members
+        .Where(u => registeredByUser.ContainsKey(u.Id))
+        .ToList();
+    var unregisteredMembers = members
+        .Where(u => !registeredByUser.ContainsKey(u.Id))
+        .ToList();
+    var orphanedRegistrations = registeredByUser
+        .Where(kvp => members.All(u => u.Id != kvp.Key))
+        .OrderBy(kvp => kvp.Key)
+        .ToList();
+
+    IReadOnlyList<Egg9000LeaderboardItem> egg9000Members = [];
+    var egg9000Status = "";
+    if(egg9000Client.IsConfigured) {
+        try {
+            egg9000Members = await egg9000Client.GetLeaderboardAsync();
+            egg9000Status = $" | E9K roster: `{egg9000Members.Count}`";
+        } catch(Exception ex) {
+            egg9000Status = " | E9K roster: unavailable";
+            Console.WriteLine($"Could not fetch E9K leaderboard API for admin-list-members: {ex.Message}");
+        }
+    }
+
+    var summary =
+        $"Server members: `{members.Count}` | Registered: `{registeredMembers.Count}` | Not registered: `{unregisteredMembers.Count}`";
+    if(orphanedRegistrations.Count > 0) {
+        summary += $" | Registered but not in server cache: `{orphanedRegistrations.Count}`";
+    }
+    summary += egg9000Status;
+
+    var embeds = BuildMemberRegistrationEmbeds(
+        guild,
+        registeredMembers,
+        unregisteredMembers,
+        orphanedRegistrations,
+        registeredByUser,
+        egg9000Members);
+
+    await SendPrivateEmbedReportAsync(command, summary, embeds);
+}
+
+async Task HandleAdminE9kCompareAsync(SocketSlashCommand command) {
+    var staffUser = command.User as SocketGuildUser;
+    if(staffUser is null || !HasStaffRole(staffUser)) {
+        await command.RespondAsync("Only members with the Staff role can compare E9K members.", ephemeral: true);
+        return;
+    }
+
+    await command.DeferAsync(ephemeral: true);
+
+    if(!egg9000Client.IsConfigured) {
+        await command.FollowupAsync("EGG9000 API access is not configured. Set `EGG9000_API_KEY` for Plotty, then restart the bot.", ephemeral: true);
+        return;
+    }
+
+    var guild = client.GetGuild(command.GuildId!.Value);
+    if(guild is null) {
+        await command.FollowupAsync("I could not read this server's member list.", ephemeral: true);
+        return;
+    }
+
+    try {
+        await guild.DownloadUsersAsync();
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not refresh guild users for admin-e9k-compare: {ex.Message}");
+    }
+
+    IReadOnlyList<Egg9000LeaderboardItem> egg9000Members;
+    try {
+        egg9000Members = await egg9000Client.GetLeaderboardAsync();
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not fetch E9K leaderboard API for admin-e9k-compare: {ex.Message}");
+        await command.FollowupAsync("I could not reach the EGG9000 roster API right now.", ephemeral: true);
+        return;
+    }
+
+    if(egg9000Members.Count == 0) {
+        await command.FollowupAsync("The EGG9000 roster API returned no members for this key.", ephemeral: true);
+        return;
+    }
+
+    var discordMembers = guild.Users
+        .Where(u => !u.IsBot)
+        .OrderBy(DiscordAccountSortName, StringComparer.OrdinalIgnoreCase)
+        .ThenBy(u => u.Id)
+        .ToList();
+    var discordMemberIds = discordMembers.Select(m => m.Id).ToHashSet();
+    var egg9000ByDiscordId = egg9000Members
+        .Where(m => m.DiscordId != 0)
+        .GroupBy(m => m.DiscordId)
+        .ToDictionary(g => g.Key, g => g.ToList());
+
+    var inBoth = discordMembers
+        .Where(m => egg9000ByDiscordId.ContainsKey(m.Id))
+        .ToList();
+    var e9kOnly = egg9000ByDiscordId
+        .Where(kvp => !discordMemberIds.Contains(kvp.Key))
+        .OrderBy(kvp => E9kSortName(kvp.Value), StringComparer.OrdinalIgnoreCase)
+        .ThenBy(kvp => kvp.Key)
+        .ToList();
+    var discordOnly = discordMembers
+        .Where(m => !egg9000ByDiscordId.ContainsKey(m.Id))
+        .ToList();
+
+    var summary = $"Discord members: `{discordMembers.Count}` | E9K guild-tag members: `{egg9000ByDiscordId.Count}` | In both: `{inBoth.Count}` | E9K only: `{e9kOnly.Count}` | Discord only: `{discordOnly.Count}`";
+    var embeds = BuildE9kCompareEmbeds(guild, inBoth, e9kOnly, discordOnly, egg9000ByDiscordId);
+    await SendPrivateEmbedReportAsync(command, summary, embeds);
+}
+
+async Task HandleAdminPingUnregisteredAsync(SocketSlashCommand command) {
+    var staffUser = command.User as SocketGuildUser;
+    if(staffUser is null || !HasStaffRole(staffUser)) {
+        await command.RespondAsync("Only members with the Staff role can ping unregistered members.", ephemeral: true);
+        return;
+    }
+
+    var message = GetString(command, "message").Trim();
+    if(string.IsNullOrWhiteSpace(message)) {
+        await command.RespondAsync("Give Plotty a message to send with the pings.", ephemeral: true);
+        return;
+    }
+
+    if(message.Length > 1200) {
+        await command.RespondAsync("Please keep the custom message under 1200 characters so the pings fit in one Discord message.", ephemeral: true);
+        return;
+    }
+
+    await command.DeferAsync(ephemeral: true);
+
+    var guild = client.GetGuild(command.GuildId!.Value);
+    if(guild is null) {
+        await command.FollowupAsync("I could not read this server's member list.", ephemeral: true);
+        return;
+    }
+
+    var unregisteredMembers = await GetUnregisteredHumanMembersAsync(guild, "admin-ping-unregistered");
+    if(unregisteredMembers.Count == 0) {
+        await command.FollowupAsync("Everyone in this server is registered with Plotty.", ephemeral: true);
+        return;
+    }
+
+    var mentionLines = BuildMentionChunks(message, unregisteredMembers.Select(u => u.Id), maxLength: 2000);
+    if(mentionLines.Count != 1) {
+        await command.FollowupAsync(
+            $"That would require `{mentionLines.Count}` Discord messages. Shorten the custom message or ping fewer unregistered members so Plotty can keep it to one message.",
+            ephemeral: true);
+        return;
+    }
+
+    await command.Channel.SendMessageAsync(
+        mentionLines[0],
+        allowedMentions: new AllowedMentions { UserIds = unregisteredMembers.Select(u => u.Id).ToList() });
+    await command.FollowupAsync($"Pinged `{unregisteredMembers.Count}` unregistered member(s).", ephemeral: true);
+}
+
+async Task SendPrivateEmbedReportAsync(SocketSlashCommand command, string summary, IReadOnlyList<Embed> embeds) {
+    if(embeds.Count == 0) {
+        await command.FollowupAsync(summary, ephemeral: true);
+        return;
+    }
+
+    await command.FollowupAsync(text: summary, embed: embeds[0], ephemeral: true);
+    foreach(var embed in embeds.Skip(1)) {
+        await command.FollowupAsync(embed: embed, ephemeral: true);
     }
 }
 
@@ -861,9 +1296,9 @@ async Task CheckMissingCoopJoinsAsync(ulong guildId) {
         return;
     }
 
-    var staffChannel = FindStaffTextChannel(guild);
-    if(staffChannel is null) {
-        Console.WriteLine("Missing coop join monitor could not find a Staff text channel.");
+    var reportChannel = FindNaughtyListChannel(guild);
+    if(reportChannel is null) {
+        Console.WriteLine("Missing coop join monitor could not find the naughty-list text channel.");
         return;
     }
 
@@ -886,11 +1321,10 @@ async Task CheckMissingCoopJoinsAsync(ulong guildId) {
         return;
     }
 
-    var snapshots = new List<MissingJoinAccountSnapshot>();
-    foreach(var account in accounts) {
-        var backup = await eggClient.GetBackupAsync(account.Eid);
-        snapshots.Add(BuildMissingJoinSnapshot(account, backup));
-    }
+    var snapshots = await SelectWithConcurrencyAsync(
+        accounts,
+        MaxEggIncAccountConcurrency,
+        async account => BuildMissingJoinSnapshot(account, await eggClient.GetBackupAsync(account.Eid)));
 
     foreach(var contract in currentContracts) {
         var contractId = contract.Identifier;
@@ -930,7 +1364,15 @@ async Task CheckMissingCoopJoinsAsync(ulong guildId) {
         }
 
         var embed = BuildMissingJoinEmbed(contract, startedAt, missingMembers);
-        await PostMissingJoinAlertAsync(staffChannel, contractId, embed);
+        var posted = await TryPostReportThreadAsync(
+            reportChannel,
+            $"Missing joins - {contractId}",
+            embed,
+            "naughty-list");
+        if(!posted) {
+            continue;
+        }
+
         await dataStore.RecordMissingJoinAlertAsync(alertKey);
     }
 }
@@ -955,6 +1397,214 @@ MissingJoinAccountSnapshot BuildMissingJoinSnapshot(RegisteredEggAccount account
     }
 
     return new MissingJoinAccountSnapshot(account, joined);
+}
+
+async Task MonitorFirstCoopAwardsAsync(ulong guildId) {
+    try {
+        await CheckFirstCoopAwardsAsync(guildId);
+        monitorHealth.ReportSuccess("first-coop-awards", guildId);
+    } catch(Exception ex) {
+        monitorHealth.ReportFailure("first-coop-awards", guildId, ex);
+        Console.WriteLine($"First coop award monitor failed: {ex}");
+    }
+
+    using var timer = new PeriodicTimer(TimeSpan.FromMinutes(10));
+    while(await timer.WaitForNextTickAsync()) {
+        try {
+            await CheckFirstCoopAwardsAsync(guildId);
+            monitorHealth.ReportSuccess("first-coop-awards", guildId);
+        } catch(Exception ex) {
+            monitorHealth.ReportFailure("first-coop-awards", guildId, ex);
+            Console.WriteLine($"First coop award monitor failed: {ex}");
+        }
+    }
+}
+
+async Task MonitorWeeklyTokenLeaderboardAsync(ulong guildId) {
+    try {
+        await CheckWeeklyTokenLeaderboardPostAsync(guildId);
+        monitorHealth.ReportSuccess("weekly-token-leaderboard", guildId);
+    } catch(Exception ex) {
+        monitorHealth.ReportFailure("weekly-token-leaderboard", guildId, ex);
+        Console.WriteLine($"Weekly token leaderboard monitor failed: {ex}");
+    }
+
+    using var timer = new PeriodicTimer(TimeSpan.FromMinutes(1));
+    while(await timer.WaitForNextTickAsync()) {
+        try {
+            await CheckWeeklyTokenLeaderboardPostAsync(guildId);
+            monitorHealth.ReportSuccess("weekly-token-leaderboard", guildId);
+        } catch(Exception ex) {
+            monitorHealth.ReportFailure("weekly-token-leaderboard", guildId, ex);
+            Console.WriteLine($"Weekly token leaderboard monitor failed: {ex}");
+        }
+    }
+}
+
+async Task CheckWeeklyTokenLeaderboardPostAsync(ulong guildId) {
+    var zone = WeeklyTokenLeaderboard.MountainTimeZone();
+    var now = DateTimeOffset.UtcNow;
+    var localNow = TimeZoneInfo.ConvertTime(now, zone);
+    if(localNow.DayOfWeek != DayOfWeek.Monday || localNow.Hour != 10) {
+        return;
+    }
+
+    var guild = client.GetGuild(guildId);
+    var generalChannel = guild is null ? null : FindGeneralChannel(guild);
+    if(guild is null || generalChannel is null) {
+        Console.WriteLine("Weekly token leaderboard monitor could not find the guild or general text channel.");
+        return;
+    }
+
+    var currentWeek = WeeklyTokenLeaderboard.CurrentWeek(now, zone);
+    var weekStart = currentWeek.Start.AddDays(-7);
+    var weekEnd = currentWeek.Start;
+    var weekKey = WeeklyTokenLeaderboard.WeekKey(weekStart, zone);
+    if(await dataStore.HasWeeklyTokenLeaderboardPostAsync(guildId, weekKey)) {
+        return;
+    }
+
+    var entries = await BuildTokenLeaderboardAsync(guildId, weekStart, weekEnd);
+    var embed = BuildTokenLeaderboardEmbed(guild, entries, weekStart, weekEnd, zone, completedWeek: true);
+    await generalChannel.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+    await dataStore.RecordWeeklyTokenLeaderboardPostAsync(
+        new WeeklyTokenLeaderboardPost(guildId, weekKey, DateTimeOffset.UtcNow));
+}
+
+async Task HandleTokenLeaderboardAsync(SocketSlashCommand command) {
+    await command.DeferAsync();
+    var zone = WeeklyTokenLeaderboard.MountainTimeZone();
+    var week = WeeklyTokenLeaderboard.CurrentWeek(DateTimeOffset.UtcNow, zone);
+    var entries = await BuildTokenLeaderboardAsync(command.GuildId!.Value, week.Start, week.End);
+    var guild = client.GetGuild(command.GuildId.Value);
+    if(guild is null) {
+        await command.FollowupAsync("I could not find this server.");
+        return;
+    }
+
+    await command.FollowupAsync(
+        embed: BuildTokenLeaderboardEmbed(guild, entries, week.Start, week.End, zone, completedWeek: false),
+        allowedMentions: AllowedMentions.None);
+}
+
+async Task<IReadOnlyList<TokenLeaderboardEntry>> BuildTokenLeaderboardAsync(
+    ulong guildId,
+    DateTimeOffset weekStart,
+    DateTimeOffset weekEnd) {
+    var accounts = await dataStore.GetRegisteredEidsAsync(guildId);
+    var backups = await GetAccountBackupsAsync(accounts);
+    return backups
+        .Select(item => {
+            var result = WeeklyTokenLeaderboard.CountTokens(item.Backup, weekStart, weekEnd);
+            return new TokenLeaderboardEntry(
+                item.Account.DiscordUserId,
+                AccountDisplayName(item.Account),
+                result.TokensSent,
+                result.ContractCount);
+        })
+        .OrderByDescending(entry => entry.TokensSent)
+        .ThenBy(entry => entry.PlayerName, StringComparer.OrdinalIgnoreCase)
+        .Take(10)
+        .ToList();
+}
+
+Embed BuildTokenLeaderboardEmbed(
+    SocketGuild guild,
+    IReadOnlyList<TokenLeaderboardEntry> entries,
+    DateTimeOffset weekStart,
+    DateTimeOffset weekEnd,
+    TimeZoneInfo zone,
+    bool completedWeek) {
+    var lines = entries
+        .Select((entry, index) => {
+            var member = guild.GetUser(entry.DiscordUserId);
+            var name = !string.IsNullOrWhiteSpace(entry.PlayerName)
+                ? entry.PlayerName
+                : member?.DisplayName ?? member?.Username ?? $"Discord user {entry.DiscordUserId}";
+            var contractText = entry.ContractCount == 1 ? "1 contract" : $"{entry.ContractCount} contracts";
+            return $"**#{index + 1} {name}** - {entry.TokensSent:N0} sent ({contractText})";
+        })
+        .ToList();
+    if(lines.Count == 0) {
+        lines.Add("No token gifts were found for registered players this week.");
+    }
+
+    var localStart = TimeZoneInfo.ConvertTime(weekStart, zone);
+    var localEnd = TimeZoneInfo.ConvertTime(weekEnd, zone);
+    return new EmbedBuilder()
+        .WithTitle("The Tokie Awards")
+        .WithColor(Color.Gold)
+        .WithDescription(string.Join("\n", lines))
+        .AddField(
+            completedWeek ? "Award week" : "Current week",
+            $"{localStart:MMM d, yyyy h:mm tt} to {localEnd:MMM d, yyyy h:mm tt} Mountain Time")
+        .WithFooter("Registered EIDs only. Counts tokens sent on contracts joined during the award week.")
+        .WithCurrentTimestamp()
+        .Build();
+}
+
+async Task CheckFirstCoopAwardsAsync(ulong guildId) {
+    var guild = client.GetGuild(guildId);
+    if(guild is null) {
+        return;
+    }
+
+    var generalChannel = FindGeneralChannel(guild);
+    if(generalChannel is null) {
+        Console.WriteLine("First coop award monitor could not find the general text channel.");
+        return;
+    }
+
+    var accounts = await dataStore.GetRegisteredEidsAsync(guildId);
+    if(accounts.Count == 0) {
+        return;
+    }
+
+    var now = DateTimeOffset.UtcNow;
+    var recentContractIds = (await eggClient.GetCurrentContractsAsync())
+        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
+        .Where(c => c.CoopAllowed)
+        .Where(c => c.StartTime > 0)
+        .Where(c => DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime) >= now.AddDays(-3))
+        .Select(c => c.Identifier)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    if(recentContractIds.Count == 0) {
+        return;
+    }
+
+    var lookups = await GetAccountCoopLookupsAsync(accounts);
+    var completedStatuses = lookups
+        .SelectMany(item => item.Lookup.StatusLookups
+            .Where(s => s.Status.AllGoalsAchieved)
+            .Where(s => recentContractIds.Contains(s.ContractId))
+            .Select(s => new FirstCoopCandidate(item.Account, s.ContractId, s.CoopCode, s.Status, s.AcceptedAt)))
+        .GroupBy(s => (ContractId: s.ContractId.ToLowerInvariant(), CoopCode: s.CoopCode.ToLowerInvariant()))
+        .Select(g => g.OrderByDescending(s => s.AcceptedAt).First())
+        .ToList();
+    if(completedStatuses.Count == 0) {
+        return;
+    }
+
+    foreach(var winner in completedStatuses
+        .GroupBy(s => s.ContractId, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g
+            .OrderBy(s => Math.Max(0, s.Status.SecondsSinceAllGoalsAchieved))
+            .ThenByDescending(s => s.Status.TotalAmount)
+            .First())) {
+        var awardKey = $"first-coop:{guildId}:{winner.ContractId.ToLowerInvariant()}";
+        if(await dataStore.HasFirstCoopAwardAsync(awardKey)) {
+            continue;
+        }
+
+        var embed = BuildFirstCoopAwardEmbed(winner.Status);
+        await generalChannel.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+        await dataStore.RecordFirstCoopAwardAsync(new FirstCoopAward(
+            awardKey,
+            guildId,
+            winner.ContractId,
+            winner.CoopCode,
+            DateTimeOffset.UtcNow));
+    }
 }
 
 Embed BuildMissingJoinEmbed(Contract contract, DateTimeOffset startedAt, IReadOnlyList<MissingJoinMember> missingMembers) {
@@ -984,28 +1634,67 @@ Embed BuildMissingJoinEmbed(Contract contract, DateTimeOffset startedAt, IReadOn
         .Build();
 }
 
-async Task PostMissingJoinAlertAsync(SocketTextChannel staffChannel, string contractId, Embed embed) {
-    var threadName = TrimForDiscordName($"Missing joins - {contractId}");
+Embed BuildFirstCoopAwardEmbed(ContractCoopStatusResponse status) {
+    var contractName = string.IsNullOrWhiteSpace(status.ContractIdentifier)
+        ? "A contract"
+        : status.ContractIdentifier;
+    var topContributors = status.Contributors
+        .OrderByDescending(c => c.ContributionAmount)
+        .Take(5)
+        .Select((c, index) => {
+            var name = string.IsNullOrWhiteSpace(c.UserName) ? "(unknown)" : c.UserName;
+            return $"{index + 1}. **{name}** - {FormatEggs(c.ContributionAmount)} contributed";
+        })
+        .ToList();
+    if(topContributors.Count == 0) {
+        topContributors.Add("No contributor rows were available.");
+    }
+
+    var completedAgo = status.SecondsSinceAllGoalsAchieved > 0
+        ? $"Completed about {FormatDuration(TimeSpan.FromSeconds(status.SecondsSinceAllGoalsAchieved))} ago."
+        : "Completed moments ago.";
+
+    return new EmbedBuilder()
+        .WithTitle("First Co-op Finish Award")
+        .WithColor(Color.Green)
+        .WithDescription($"A registered co-op finished **{contractName}** first. Nicely done.")
+        .AddField("Result", completedAgo, true)
+        .AddField("Members", status.Contributors.Count.ToString("0"), true)
+        .AddField("Total Eggs", FormatEggs(status.TotalAmount), true)
+        .AddField("Top Contributors", string.Join("\n", topContributors), false)
+        .WithFooter("Co-op name hidden for privacy.")
+        .WithCurrentTimestamp()
+        .Build();
+}
+
+async Task<bool> TryPostReportThreadAsync(SocketTextChannel reportChannel, string threadName, Embed embed, string channelLabel) {
     try {
-        var thread = await staffChannel.CreateThreadAsync(threadName, ThreadType.PublicThread, ThreadArchiveDuration.OneDay);
+        var thread = await reportChannel.CreateThreadAsync(
+            TrimForDiscordThreadName(threadName),
+            ThreadType.PublicThread,
+            ThreadArchiveDuration.OneDay);
         await thread.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+        return true;
     } catch(Exception ex) {
-        Console.WriteLine($"Could not create staff thread for missing joins: {ex}");
-        await staffChannel.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+        Console.WriteLine($"Could not create {channelLabel} report thread: {ex}");
+        return false;
     }
 }
 
-static SocketTextChannel? FindStaffTextChannel(SocketGuild guild) =>
-    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "staff");
+static SocketTextChannel? FindPlottyReportsChannel(SocketGuild guild) =>
+    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "plottyreports");
+
+static SocketTextChannel? FindNaughtyListChannel(SocketGuild guild) =>
+    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "naughtylist");
+
+static SocketTextChannel? FindGeneralChannel(SocketGuild guild) =>
+    guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "general");
 
 static SocketTextChannel? FindPlottyQuestionsChannel(SocketGuild guild) =>
     guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "plottyquestions");
 
 static SocketTextChannel? FindModLogChannel(SocketGuild guild) =>
     guild.TextChannels.FirstOrDefault(c => NormalizeName(c.Name) == "modlog");
-
-static SocketTextChannel? FindStaffNoticeChannel(SocketGuild guild) =>
-    FindPlottyQuestionsChannel(guild) ?? FindStaffTextChannel(guild);
 
 async Task SendRegistrationWelcomeAsync(ulong guildId, IUser user) {
     var guild = client.GetGuild(guildId);
@@ -1028,7 +1717,12 @@ async Task HandleAddDemeritAsync(SocketSlashCommand command) {
         return;
     }
 
-    var member = (SocketGuildUser)command.Data.Options.First(o => o.Name == "member").Value;
+    var member = ResolveGuildMemberOption(command, "member");
+    if(member is null) {
+        await command.RespondAsync("I can only add demerits to members in this server.", ephemeral: true);
+        return;
+    }
+
     var amount = Math.Max(1, Convert.ToInt32(command.Data.Options.FirstOrDefault(o => o.Name == "amount")?.Value ?? 1));
     var reason = command.Data.Options.FirstOrDefault(o => o.Name == "reason")?.Value as string;
 
@@ -1049,7 +1743,12 @@ async Task HandleRemoveDemeritAsync(SocketSlashCommand command) {
         return;
     }
 
-    var member = (SocketGuildUser)command.Data.Options.First(o => o.Name == "member").Value;
+    var member = ResolveGuildMemberOption(command, "member");
+    if(member is null) {
+        await command.RespondAsync("I can only remove demerits from members in this server.", ephemeral: true);
+        return;
+    }
+
     var amount = Math.Max(1, Convert.ToInt32(command.Data.Options.FirstOrDefault(o => o.Name == "amount")?.Value ?? 1));
     var removed = await dataStore.RemoveDemeritsAsync(command.GuildId!.Value, member.Id, amount);
     await command.RespondAsync($"Removed `{removed}` active demerit(s) from {member.Mention}.", ephemeral: true);
@@ -1099,6 +1798,62 @@ string BuildCoopLookupDiagnostic(PlayerCoopLookupResult lookup) {
     ]);
 }
 
+Task<IReadOnlyList<(RegisteredEggAccount Account, Backup? Backup)>> GetAccountBackupsAsync(
+    IEnumerable<RegisteredEggAccount> accounts) =>
+    SelectWithConcurrencyAsync(
+        accounts.ToList(),
+        MaxEggIncAccountConcurrency,
+        async account => (account, await eggClient.GetBackupAsync(account.Eid)));
+
+Task<IReadOnlyList<(RegisteredEggAccount Account, PlayerCoopLookupResult Lookup)>> GetAccountCoopLookupsAsync(
+    IEnumerable<RegisteredEggAccount> accounts) =>
+    SelectWithConcurrencyAsync(
+        accounts.ToList(),
+        MaxEggIncAccountConcurrency,
+        async account => (account, await eggClient.GetPlayerCoopLookupAsync(account.Eid)));
+
+async Task<(
+    IReadOnlyDictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse> Statuses,
+    int Failed,
+    int SkippedOldContracts,
+    int RecentContractCount)> GetRecentRegisteredStatusesAsync(IReadOnlyList<RegisteredEggAccount> accounts) {
+    var now = DateTimeOffset.UtcNow;
+    var recentContractIds = (await eggClient.GetCurrentContractsAsync())
+        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
+        .Where(c => c.StartTime > 0)
+        .Where(c => DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime) >= now.AddDays(-3))
+        .Where(c => c.ExpirationTime <= 0 || DateTimeOffset.FromUnixTimeSeconds((long)c.ExpirationTime) > now)
+        .Select(c => c.Identifier)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    if(recentContractIds.Count == 0) {
+        return (new Dictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse>(), 0, 0, 0);
+    }
+
+    var statuses = new Dictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse>();
+    var failed = 0;
+    var skippedOldContracts = 0;
+    var lookups = await GetAccountCoopLookupsAsync(accounts);
+    foreach(var item in lookups) {
+        var lookup = item.Lookup;
+        if(lookup.Statuses.Count == 0) {
+            failed++;
+            continue;
+        }
+
+        foreach(var status in lookup.Statuses) {
+            if(!recentContractIds.Contains(status.ContractId)) {
+                skippedOldContracts++;
+                continue;
+            }
+
+            var key = (status.ContractId.ToLowerInvariant(), status.CoopCode.ToLowerInvariant());
+            statuses.TryAdd(key, status.Status);
+        }
+    }
+
+    return (statuses, failed, skippedOldContracts, recentContractIds.Count);
+}
+
 async Task HandleEggsLaidAsync(SocketSlashCommand command) {
     await command.DeferAsync(ephemeral: true);
 
@@ -1108,9 +1863,11 @@ async Task HandleEggsLaidAsync(SocketSlashCommand command) {
         return;
     }
 
+    var backups = await GetAccountBackupsAsync(accounts.Take(10));
     var embeds = new List<Embed>();
-    foreach(var account in accounts.Take(10)) {
-        var backup = await eggClient.GetBackupAsync(account.Eid);
+    foreach(var item in backups) {
+        var account = item.Account;
+        var backup = item.Backup;
         if(backup is not null) {
             embeds.Add(BuildEggsLaidEmbed(backup, account));
         }
@@ -1136,11 +1893,15 @@ async Task HandleContractArtifactsAsync(SocketSlashCommand command) {
         return;
     }
 
-    var embeds = new List<Embed>();
-    foreach(var account in accounts.Take(10)) {
-        var backup = await eggClient.GetBackupAsync(account.Eid);
-        embeds.Add(BuildContractArtifactsEmbed(backup, account));
-    }
+    var lookups = await GetAccountCoopLookupsAsync(accounts.Take(10));
+    var embeds = lookups
+        .Select(item => {
+            var backup = item.Lookup.Backup;
+            var status = FindCurrentCoopStatus(backup, item.Lookup);
+            var coopContext = CoopArtifactAnalyzer.Analyze(status, item.Account, backup?.UserName);
+            return BuildContractArtifactsEmbed(backup, item.Account, coopContext);
+        })
+        .ToList();
 
     for(var i = 0; i < embeds.Count; i += 10) {
         await command.FollowupAsync(
@@ -1160,10 +1921,12 @@ async Task HandleShipsAsync(SocketSlashCommand command) {
         return;
     }
 
+    var backups = await GetAccountBackupsAsync(accounts.Take(10));
     var embeds = new List<Embed>();
     var notificationCount = 0;
-    foreach(var account in accounts.Take(10)) {
-        var backup = await eggClient.GetBackupAsync(account.Eid);
+    foreach(var item in backups) {
+        var account = item.Account;
+        var backup = item.Backup;
         var missions = GetActiveShipMissions(backup).ToList();
         embeds.Add(BuildShipsEmbed(backup, account, missions, notify));
 
@@ -1226,29 +1989,33 @@ async Task HandleRegisterEidModalAsync(SocketModal modal) {
     await modal.DeferAsync(ephemeral: true);
 
     var eid = EggIncClient.NormalizeEggId(modal.Data.Components.First(c => c.CustomId == "eid").Value);
-    var backup = await eggClient.GetBackupAsync(eid);
-    if(backup is null) {
+    var validation = await eggClient.ValidateEggIdAsync(eid);
+    if(!validation.IsValid) {
         await modal.FollowupAsync("Plotty could not validate that EID with Egg Inc. Please double-check it and try again.", ephemeral: true);
         return;
     }
 
-    var eggName = string.IsNullOrWhiteSpace(backup.UserName) ? null : backup.UserName;
+    var eggName = string.IsNullOrWhiteSpace(validation.EggName) ? null : validation.EggName;
     await dataStore.SaveRegisteredEidAsync(modal.GuildId.Value, modal.User.Id, eid, eggName);
-    await dataStore.LinkAsync(new EggUserLink(modal.GuildId.Value, modal.User.Id, eid, eggName));
 
     var accounts = await dataStore.GetRegisteredAccountsAsync(modal.GuildId.Value, modal.User.Id);
     var suffix = SecureText.Sha256(eid)[..8];
+    var parseNote = validation.BackupParseLimited
+        ? " Egg Inc returned one malformed optional backup field, so I saved the EID without an Egg Inc display name for now."
+        : "";
     await modal.FollowupAsync(
-        $"Saved your EID securely and tied it to your Discord name. You now have `{accounts.Count}` EID account(s) registered. Stored hash ending: `{suffix}`.",
+        $"Saved your EID securely and tied it to your Discord name. You now have `{accounts.Count}` EID account(s) registered. Stored hash ending: `{suffix}`.{parseNote}",
         ephemeral: true);
 
     await SendRegistrationWelcomeAsync(modal.GuildId.Value, modal.User);
 }
 
 async Task HandleBeerPlottyAsync(SocketSlashCommand command) {
+    var drink = GetString(command, "drink");
     var botBuysBack = Random.Shared.Next(5) == 0;
     var isPlottyAdmin = command.User is SocketGuildUser beerUser && IsPlottyAdmin(beerUser);
-    var result = await dataStore.TryAddPlottyBeerAsync(command.GuildId!.Value, command.User.Id, botBuysBack, bypassCooldown: isPlottyAdmin);
+    var bypassCooldown = isPlottyAdmin || !IsCooldownLimitedBeverage(drink);
+    var result = await dataStore.TryAddPlottyBeerAsync(command.GuildId!.Value, command.User.Id, botBuysBack, bypassCooldown);
     if(!result.Accepted) {
         await command.RespondAsync(
             $"{command.User.Mention} Plotty appreciates the enthusiasm, but Plotty is pacing responsibly. Try again in `{FormatDuration(result.RetryAfter ?? TimeSpan.FromHours(1))}`.",
@@ -1261,14 +2028,14 @@ async Task HandleBeerPlottyAsync(SocketSlashCommand command) {
 
     var plottyMention = client.CurrentUser.Mention;
     var response = botBuysBack
-        ? $"{plottyMention} accepts the beer from {command.User.Mention}. {PlottyPersonality.BeerGiftResponse(await dataStore.RecordPlottyInteractionAsync(command.GuildId!.Value, command.User.Id, "beer_bot_buyback"))}\n\nYou earned a spot on the Beer Leaderboard. Total Plotty-bought beers: `{stats.BeersBoughtByBot}`."
-        : $"{plottyMention} accepts the beer from {command.User.Mention}. {PlottyPersonality.BeerThanksResponse(await dataStore.RecordPlottyInteractionAsync(command.GuildId!.Value, command.User.Id, "beer_plotty"))}\n\nBeers donated to Plotty: `{stats.BeersGivenToBot}`.";
+        ? $"{plottyMention} accepts the {drink} from {command.User.Mention}. {PlottyPersonality.BeerGiftResponse(await dataStore.RecordPlottyInteractionAsync(command.GuildId!.Value, command.User.Id, "beer_bot_buyback"))}\n\nYou earned a spot on the Beverage Leaderboard. Total Plotty-bought beverages: `{stats.BeersBoughtByBot}`."
+        : $"{plottyMention} accepts the {drink} from {command.User.Mention}. {PlottyPersonality.BeerThanksResponse(await dataStore.RecordPlottyInteractionAsync(command.GuildId!.Value, command.User.Id, "beer_plotty"))}\n\nBeverages donated to Plotty: `{stats.BeersGivenToBot}`.";
 
     var embed = new EmbedBuilder()
-        .WithTitle(botBuysBack ? "Plotty Bought A Round" : $"{displayName} bought Plotty a beer")
+        .WithTitle(botBuysBack ? "Plotty Bought A Round" : $"{displayName} bought Plotty a beverage")
         .WithColor(botBuysBack ? Color.Green : Color.Orange)
         .WithDescription(response)
-        .WithFooter($"{displayName} has given {stats.BeersGivenToBot} beer(s) and received {stats.BeersBoughtByBot}.")
+        .WithFooter($"{displayName} has given {stats.BeersGivenToBot} beverage(s) and received {stats.BeersBoughtByBot}.")
         .WithCurrentTimestamp()
         .Build();
 
@@ -1277,50 +2044,58 @@ async Task HandleBeerPlottyAsync(SocketSlashCommand command) {
 
 async Task HandleBeerUserAsync(SocketSlashCommand command) {
     var recipient = (SocketGuildUser)command.Data.Options.First(o => o.Name == "member").Value;
+    var drink = GetString(command, "drink");
+    var pingRecipient = GetBool(command, "ping");
     var giver = (SocketGuildUser)command.User;
     var isPlottyAdmin = IsPlottyAdmin(giver);
+    var bypassCooldown = isPlottyAdmin || !IsCooldownLimitedBeverage(drink);
 
     if(recipient.IsBot) {
-        await command.RespondAsync("Plotty appreciates the gesture, but `/beer-user` is for guild members. Use `/beer-plotty` for Plotty.", ephemeral: true);
+        await command.RespondAsync("Plotty appreciates the gesture, but `/beverage-user` is for guild members. Use `/beverage-plotty` for Plotty.", ephemeral: true);
         return;
     }
 
     if(recipient.Id == giver.Id && !isPlottyAdmin) {
-        await command.RespondAsync("Plotty admires the confidence, but members cannot gift themselves a beer.", ephemeral: true);
+        await command.RespondAsync("Plotty admires the confidence, but members cannot gift themselves a beverage.", ephemeral: true);
         return;
     }
 
-    var result = await dataStore.TryGiftBeerAsync(command.GuildId!.Value, giver.Id, recipient.Id, bypassCooldown: isPlottyAdmin);
+    var result = await dataStore.TryGiftBeerAsync(command.GuildId!.Value, giver.Id, recipient.Id, bypassCooldown);
     if(!result.Accepted) {
         await command.RespondAsync(
-            $"{giver.Mention} Plotty says the pub has standards. You can gift {recipient.Mention} another beer in `{FormatDuration(result.RetryAfter ?? TimeSpan.FromDays(1))}`.",
+            $"{giver.Mention} Plotty says the town has standards. You can gift {recipient.Mention} another beverage in `{FormatDuration(result.RetryAfter ?? TimeSpan.FromDays(1))}`.",
             ephemeral: true);
         return;
     }
 
     var stats = result.Stats;
-    var pubTitle = PubTitle(stats.BeersReceivedFromMembers);
-    var milestone = PubMilestoneMessage(stats.BeersReceivedFromMembers, recipient.Mention);
-    var description = $"{giver.Mention} bought {recipient.Mention} a beer.\n\n" +
-                      $"{recipient.DisplayName} has received `{stats.BeersReceivedFromMembers}` member-gifted beer(s)." +
-                      (string.IsNullOrWhiteSpace(pubTitle) ? "" : $"\nPub status: **{pubTitle}**") +
+    var townTitle = TownTitle(stats.BeersReceivedFromMembers);
+    var milestone = TownMilestoneMessage(stats.BeersReceivedFromMembers, recipient.Mention);
+    var description = $"{giver.Mention} bought {recipient.Mention} a {drink}.\n\n" +
+                      $"{recipient.DisplayName} has received `{stats.BeersReceivedFromMembers}` member-gifted beverage(s)." +
+                      (string.IsNullOrWhiteSpace(townTitle) ? "" : $"\nTown status: **{townTitle}**") +
                       (string.IsNullOrWhiteSpace(milestone) ? "" : $"\n\n{milestone}");
 
     var embed = new EmbedBuilder()
-        .WithTitle("Beer Gifted")
+        .WithTitle("Beverage Gifted")
         .WithColor(Color.Orange)
         .WithDescription(description)
-        .WithFooter(isPlottyAdmin ? "Admin override used." : "Members can gift the same member once per day.")
+        .WithFooter("Beer and wine are limited to once per hour. Other beverages are unlimited.")
         .WithCurrentTimestamp()
         .Build();
 
-    await command.RespondAsync(embed: embed);
+    await command.RespondAsync(
+        text: pingRecipient ? recipient.Mention : null,
+        embed: embed,
+        allowedMentions: pingRecipient
+            ? new AllowedMentions { UserIds = [recipient.Id] }
+            : AllowedMentions.None);
 }
 
 async Task HandleBeerLeaderAsync(SocketSlashCommand command) {
     var leaders = await dataStore.GetBeerLeaderboardAsync(command.GuildId!.Value);
     if(leaders.Count == 0 || leaders.All(l => l.BeersBoughtByBot == 0 && l.BeersReceivedFromMembers == 0)) {
-        await command.RespondAsync("The Beer Leaderboard is empty. Run `/beer-plotty` or gift someone a beer with `/beer-user`.");
+        await command.RespondAsync("The Beverage Leaderboard is empty. Run `/beverage-plotty` or gift someone a beverage with `/beverage-user`.", ephemeral: true);
         return;
     }
 
@@ -1331,10 +2106,10 @@ async Task HandleBeerLeaderAsync(SocketSlashCommand command) {
         .Select((entry, index) => {
             var user = guild?.GetUser(entry.DiscordUserId);
             var name = user?.DisplayName ?? $"User {entry.DiscordUserId}";
-            return $"`#{index + 1}` **{name}** - {entry.BeersBoughtByBot} Plotty beer(s), {entry.BeersGivenToBot} donated";
+            return $"`#{index + 1}` **{name}** - {entry.BeersBoughtByBot} Plotty beverage(s), {entry.BeersGivenToBot} donated";
         })
         .ToList();
-    var pubLines = leaders
+    var townLines = leaders
         .Where(l => l.BeersReceivedFromMembers > 0)
         .OrderByDescending(l => l.BeersReceivedFromMembers)
         .ThenBy(l => l.FirstBeerAt)
@@ -1342,27 +2117,27 @@ async Task HandleBeerLeaderAsync(SocketSlashCommand command) {
         .Select((entry, index) => {
             var user = guild?.GetUser(entry.DiscordUserId);
             var name = user?.DisplayName ?? $"User {entry.DiscordUserId}";
-            var title = PubTitle(entry.BeersReceivedFromMembers);
-            return $"`#{index + 1}` **{name}** - {entry.BeersReceivedFromMembers} gifted beer(s)" +
-                   (string.IsNullOrWhiteSpace(title) ? "" : $" · **{title}**");
+            var title = TownTitle(entry.BeersReceivedFromMembers);
+            return $"`#{index + 1}` **{name}** - {entry.BeersReceivedFromMembers} gifted beverage(s)" +
+                   (string.IsNullOrWhiteSpace(title) ? "" : $" - **{title}**");
         })
         .ToList();
 
     var builder = new EmbedBuilder()
-        .WithTitle("Beer Leaderboard")
+        .WithTitle("Beverage Leaderboard")
         .WithColor(Color.Gold)
-        .WithFooter("Pub titles: 10 Local, 50 Patron, 100 Basically live here.")
+        .WithFooter("Town titles: 10 Local, 50 Patron, 100 Basically live here.")
         .WithCurrentTimestamp();
 
     if(plottyLines.Count > 0) {
         builder.AddField("Plotty Bought Back", string.Join("\n", plottyLines));
     }
 
-    if(pubLines.Count > 0) {
-        builder.AddField("Pub Regulars", string.Join("\n", pubLines));
+    if(townLines.Count > 0) {
+        builder.AddField("Town Regulars", string.Join("\n", townLines));
     }
 
-    await command.RespondAsync(embed: builder.Build());
+    await command.RespondAsync(embed: builder.Build(), ephemeral: true);
 }
 
 async Task HandlePlottyMoodAsync(SocketSlashCommand command) {
@@ -1393,248 +2168,65 @@ async Task HandleAdminPlottySpeakAsync(SocketSlashCommand command) {
         return;
     }
 
+    var targetChannel = ResolveCachedInteractionMessageChannel(command);
+    if(targetChannel is null) {
+        await command.RespondAsync("Plotty could not access this channel as a normal bot message. Check Plotty's channel permissions and try again.", ephemeral: true);
+        return;
+    }
+
+    var content = TrimDiscordMessage(message, 2000);
     await command.RespondAsync("Plotty has spoken.", ephemeral: true);
-    await command.Channel.SendMessageAsync(message);
-    await LogPlottySpeakAsync(command, staffUser, message);
+    await targetChannel.SendMessageAsync(
+        content,
+        allowedMentions: new AllowedMentions(AllowedMentionTypes.Users | AllowedMentionTypes.Roles));
+    await LogPlottySpeakAsync(command, staffUser, content);
 }
 
 async Task LogPlottySpeakAsync(SocketSlashCommand command, SocketGuildUser staffUser, string message) {
-    var guild = client.GetGuild(command.GuildId!.Value);
-    var modLog = guild is null ? null : FindModLogChannel(guild);
-    if(modLog is null) {
-        return;
-    }
-
-    var sourceChannel = command.Channel is SocketGuildChannel channel
-        ? $"<#{channel.Id}>"
-        : command.Channel.Name;
-    var embed = new EmbedBuilder()
-        .WithTitle("Plotty Speak Used")
-        .WithColor(Color.DarkGrey)
-        .AddField("Used by", $"{staffUser.Mention} (`{staffUser.Username}`)", true)
-        .AddField("Channel", sourceChannel, true)
-        .AddField("Message", TrimDiscordMessage(message, 1000))
-        .WithCurrentTimestamp()
-        .Build();
-
-    await modLog.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
-}
-
-async Task HandleHelpAsync(SocketSlashCommand command) {
-    await command.DeferAsync();
-
-    var question = GetString(command, "question");
-    var personalAnswer = await TryBuildPersonalHelpAnswerAsync(command, question);
-    if(personalAnswer is not null) {
-        var personalEmbed = new EmbedBuilder()
-            .WithTitle(personalAnswer.Title)
-            .WithColor(Color.Purple)
-            .WithDescription(personalAnswer.Answer)
-            .AddField("Source", personalAnswer.Source)
-            .WithFooter("Plotty used your registered EID backup plus Egg Inc Wiki context.")
-            .WithCurrentTimestamp();
-
-        if(!string.IsNullOrWhiteSpace(personalAnswer.ImageUrl)) {
-            personalEmbed.WithThumbnailUrl(personalAnswer.ImageUrl);
+    try {
+        var guild = client.GetGuild(command.GuildId!.Value);
+        var modLog = guild is null ? null : FindModLogChannel(guild);
+        if(modLog is null) {
+            return;
         }
 
-        await command.FollowupAsync(embed: personalEmbed.Build());
-        return;
+        var sourceChannel = command.Channel is SocketGuildChannel channel
+            ? $"<#{channel.Id}>"
+            : command.ChannelId is ulong channelId
+                ? $"<#{channelId}>"
+                : "Unknown channel";
+        var embed = new EmbedBuilder()
+            .WithTitle("Plotty Speak Used")
+            .WithColor(Color.DarkGrey)
+            .AddField("Used by", $"{staffUser.Mention} (`{staffUser.Username}`)", true)
+            .AddField("Channel", sourceChannel, true)
+            .AddField("Message", TrimDiscordMessage(message, 1000))
+            .WithCurrentTimestamp()
+            .Build();
+
+        await modLog.SendMessageAsync(embed: embed, allowedMentions: AllowedMentions.None);
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not write Plotty speak audit log: {ex.GetType().Name}: {ex.Message}");
     }
-
-    var answer = await wikiClient.AnswerAsync(question);
-    if(answer is null) {
-        await command.FollowupAsync(
-            "Plotty could not find a good Egg Inc Wiki page for that. Try asking with a specific term like `prestige`, `contracts`, `artifacts`, or `boosts`.",
-            ephemeral: true);
-        return;
-    }
-
-    var embed = new EmbedBuilder()
-        .WithTitle($"Plotty Help - {answer.Title}")
-        .WithColor(Color.Blue)
-        .WithDescription(answer.Answer)
-        .AddField("Source", $"[Egg Inc Wiki: {answer.Title}]({answer.Url})")
-        .WithFooter("Answers come from the Egg Inc Wiki and may reflect community-maintained info.")
-        .WithCurrentTimestamp()
-        .Build();
-
-    await command.FollowupAsync(embed: embed);
 }
 
-async Task<PersonalHelpAnswer?> TryBuildPersonalHelpAnswerAsync(SocketSlashCommand command, string question) {
-    if(!LooksLikePersonalFarmerRankQuestion(question)) {
+IMessageChannel? ResolveCachedInteractionMessageChannel(SocketSlashCommand command) {
+    if(command.Channel is IMessageChannel channel) {
+        return channel;
+    }
+
+    if(command.ChannelId is not ulong channelId) {
         return null;
     }
 
-    var accounts = await dataStore.GetRegisteredAccountsAsync(command.GuildId!.Value, command.User.Id);
-    var account = accounts.FirstOrDefault();
-    if(account is null) {
-        return new PersonalHelpAnswer(
-            "Plotty Help - Registered EID Needed",
-            "Plotty can answer personal PE/SE farmer-level questions after you run `/register-eid`.",
-            "Personal backup unavailable until an EID is registered.",
-            null);
+    var guild = command.GuildId is ulong guildId ? client.GetGuild(guildId) : null;
+    if(guild?.GetChannel(channelId) is IMessageChannel guildChannel) {
+        return guildChannel;
     }
 
-    var backup = await eggClient.GetBackupAsync(account.Eid);
-    if(backup?.Game is null) {
-        return new PersonalHelpAnswer(
-            "Plotty Help - Backup Unavailable",
-            "Plotty could not pull your Egg Inc backup right now. Please try again in a bit.",
-            "Egg Inc backup lookup failed.",
-            null);
-    }
-
-    return BuildFarmerRankHelpAnswer(backup);
+    return client.GetChannel(channelId) as IMessageChannel;
 }
 
-static bool LooksLikePersonalFarmerRankQuestion(string question) {
-    var normalized = NormalizeName(question);
-    return (normalized.Contains("my") || normalized.Contains("me")) &&
-           (normalized.Contains("farmer") || normalized.Contains("level") || normalized.Contains("rank")) &&
-           (normalized.Contains("pe") || normalized.Contains("prophecy") || normalized.Contains("se") || normalized.Contains("soul"));
-}
-
-static PersonalHelpAnswer BuildFarmerRankHelpAnswer(Backup backup) {
-    var game = backup.Game;
-    var soulEggs = GetSoulEggs(game);
-    var unclaimedSoulEggs = GetUnclaimedSoulEggs(game);
-    var prophecyEggs = (double)game.EggsOfProphecy;
-    var unclaimedPe = game.UnclaimedEggsOfProphecy;
-    var soulFoodLevel = GetEpicResearchLevel(game, "soul_eggs");
-    var prophecyBonusLevel = GetEpicResearchLevel(game, "prophecy_bonus");
-    var soulEggBonus = soulFoodLevel + 10d;
-    var prophecyEggBonus = ((prophecyBonusLevel + 5d) / 100d) + 1d;
-    var earningsBonus = soulEggs * soulEggBonus * Math.Pow(prophecyEggBonus, prophecyEggs);
-    var currentRank = GetFarmerRank(earningsBonus);
-    var nextRank = GetFarmerRankByOom(Math.Min(currentRank.Oom + 1, 51));
-
-    if(currentRank.Oom >= 51) {
-        return new PersonalHelpAnswer(
-            "Plotty Help - Farmer Level",
-            $"You are already **{currentRank.Name}**.\n\n**SE:** {FormatEggs(soulEggs)}\n**PE:** {prophecyEggs:0}\n**Estimated EB:** {FormatEggs(earningsBonus)}%",
-            "[Egg Inc Wiki: Earnings Bonus](https://egg-inc.fandom.com/wiki/Earnings_Bonus)",
-            "https://egg-inc.fandom.com/wiki/Special:Redirect/file/Egg_of_Prophecy.png");
-    }
-
-    var targetEb = 100d * Math.Pow(10, nextRank.Oom);
-    var seNeededWithCurrentPe = Math.Max(0, targetEb / (soulEggBonus * Math.Pow(prophecyEggBonus, prophecyEggs)) - soulEggs);
-    var peOnlyNeeded = Enumerable.Range(0, 300)
-        .FirstOrDefault(extraPe => targetEb / (soulEggBonus * Math.Pow(prophecyEggBonus, prophecyEggs + extraPe)) <= soulEggs, -1);
-
-    var lines = new List<string> {
-        $"You are currently **{currentRank.Name}** and your next farmer level is **{nextRank.Name}**.",
-        "",
-        $"**Current SE:** {FormatEggs(soulEggs)}",
-        $"**Current PE:** {prophecyEggs:0}",
-        $"**Estimated EB:** {FormatEggs(earningsBonus)}%",
-        $"**Target EB:** {FormatEggs(targetEb)}%",
-        "",
-        $"With your current PE, you need about **{FormatEggs(seNeededWithCurrentPe)} more SE**."
-    };
-
-    if(peOnlyNeeded >= 0) {
-        lines.Add($"With no extra SE, you need about **{peOnlyNeeded} more PE**.");
-    } else {
-        lines.Add("With no extra SE, Plotty did not find a PE-only path within 300 additional PE.");
-    }
-
-    lines.Add("");
-    if(unclaimedSoulEggs > 0 || unclaimedPe > 0) {
-        lines.Add($"Unclaimed backup values not counted in active EB: `{FormatEggs(unclaimedSoulEggs)}` SE and `{unclaimedPe}` PE.");
-    }
-
-    lines.Add($"Plotty used Soul Food level `{soulFoodLevel}` and Prophecy Bonus level `{prophecyBonusLevel}` from your backup for this estimate.");
-
-    return new PersonalHelpAnswer(
-        "Plotty Help - Next Farmer Level",
-        string.Join("\n", lines),
-        "[Egg Inc Wiki: Earnings Bonus](https://egg-inc.fandom.com/wiki/Earnings_Bonus) and your registered EID backup",
-        "https://egg-inc.fandom.com/wiki/Special:Redirect/file/Egg_of_Prophecy.png");
-}
-
-static double GetSoulEggs(Backup.Types.Game game) {
-    return game.SoulEggsD > 0 ? game.SoulEggsD : game.SoulEggs;
-}
-
-static double GetUnclaimedSoulEggs(Backup.Types.Game game) {
-    return game.UnclaimedSoulEggsD > 0 ? game.UnclaimedSoulEggsD : game.UnclaimedSoulEggs;
-}
-
-static uint GetEpicResearchLevel(Backup.Types.Game game, string id) {
-    return game.EpicResearch
-        .FirstOrDefault(item => string.Equals(item.Id, id, StringComparison.OrdinalIgnoreCase))
-        ?.Level ?? 0;
-}
-
-static FarmerRankInfo GetFarmerRank(double earningsBonus) {
-    var oom = earningsBonus <= 0 ? 0 : (int)Math.Floor(Math.Log10(earningsBonus / 100d));
-    return GetFarmerRankByOom(oom);
-}
-
-static FarmerRankInfo GetFarmerRankByOom(int oom) {
-    var ranks = GetFarmerRanks();
-    var clamped = Math.Clamp(oom, 0, ranks.Length - 1);
-    return ranks[clamped];
-}
-
-static FarmerRankInfo[] GetFarmerRanks() {
-    return [
-        new(0, "Farmer"),
-        new(1, "Farmer II"),
-        new(2, "Farmer III"),
-        new(3, "Kilofarmer"),
-        new(4, "Kilofarmer II"),
-        new(5, "Kilofarmer III"),
-        new(6, "Megafarmer"),
-        new(7, "Megafarmer II"),
-        new(8, "Megafarmer III"),
-        new(9, "Gigafarmer"),
-        new(10, "Gigafarmer II"),
-        new(11, "Gigafarmer III"),
-        new(12, "Terafarmer"),
-        new(13, "Terafarmer II"),
-        new(14, "Terafarmer III"),
-        new(15, "Petafarmer"),
-        new(16, "Petafarmer II"),
-        new(17, "Petafarmer III"),
-        new(18, "Exafarmer"),
-        new(19, "Exafarmer II"),
-        new(20, "Exafarmer III"),
-        new(21, "Zettafarmer"),
-        new(22, "Zettafarmer II"),
-        new(23, "Zettafarmer III"),
-        new(24, "Yottafarmer"),
-        new(25, "Yottafarmer II"),
-        new(26, "Yottafarmer III"),
-        new(27, "Xennafarmer"),
-        new(28, "Xennafarmer II"),
-        new(29, "Xennafarmer III"),
-        new(30, "Weccafarmer"),
-        new(31, "Weccafarmer II"),
-        new(32, "Weccafarmer III"),
-        new(33, "Vendafarmer"),
-        new(34, "Vendafarmer II"),
-        new(35, "Vendafarmer III"),
-        new(36, "Uadafarmer"),
-        new(37, "Uadafarmer II"),
-        new(38, "Uadafarmer III"),
-        new(39, "Treidafarmer"),
-        new(40, "Treidafarmer II"),
-        new(41, "Treidafarmer III"),
-        new(42, "Quadafarmer"),
-        new(43, "Quadafarmer II"),
-        new(44, "Quadafarmer III"),
-        new(45, "Pendafarmer"),
-        new(46, "Pendafarmer II"),
-        new(47, "Pendafarmer III"),
-        new(48, "Exedafarmer"),
-        new(49, "Exedafarmer II"),
-        new(50, "Exedafarmer III"),
-        new(51, "Infinifarmer")
-    ];
-}
 
 Embed? BuildContributionEmbed(
     string contractId,
@@ -1677,7 +2269,7 @@ Embed? BuildContributionEmbed(
     var lines = players.Select(p => {
         var name = string.IsNullOrWhiteSpace(p.UserName) ? "(unknown)" : p.UserName;
         var flag = !p.Active ? " inactive" : p.TimeCheatDetected ? " flagged" : "";
-        return $"**{name}** - {FormatEggs(p.ContributionRate * 3600)}/hr · {FormatEggs(p.ContributionAmount)} contributed{flag}";
+        return $"**{name}** - {FormatEggs(p.ContributionRate * 3600)}/hr, {FormatEggs(p.ContributionAmount)} contributed{flag}";
     });
 
     builder.WithDescription(string.Join("\n", lines));
@@ -1719,7 +2311,8 @@ Embed? BuildRegisteredContractEmbed(
         .Build();
 }
 
-async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string displayName, Backup? backup) {
+async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string displayName, PlayerCoopLookupResult lookup) {
+    var backup = lookup.Backup;
     var builder = new EmbedBuilder()
         .WithTitle($"Player - {displayName} ({AccountDisplayName(account)})")
         .WithColor(Color.Blue)
@@ -1731,15 +2324,7 @@ async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string dis
         return builder.Build();
     }
 
-    var contracts = backup.Contracts.Contracts
-        .Concat(backup.Contracts.Archive)
-        .Where(c => !c.Cancelled)
-        .Select(c => new PlayerContractCandidate(GetLocalContractId(c), c.CoopIdentifier, c.TimeAccepted))
-        .Where(c => !string.IsNullOrWhiteSpace(c.ContractId) && !string.IsNullOrWhiteSpace(c.CoopCode))
-        .GroupBy(c => c.ContractId, StringComparer.OrdinalIgnoreCase)
-        .Select(g => g.OrderByDescending(c => c.AcceptedAt).First())
-        .OrderByDescending(c => c.AcceptedAt)
-        .ToList();
+    var contracts = BuildPlayerRateCandidates(backup);
 
     if(contracts.Count == 0) {
         builder.AddField("Average Contribution", "No recent contract history found.");
@@ -1748,7 +2333,21 @@ async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string dis
     }
 
     var rates = new List<PlayerContractRate>();
+    foreach(var statusLookup in lookup.StatusLookups.OrderByDescending(s => s.AcceptedAt)) {
+        var contributor = statusLookup.Status.Contributors.FirstOrDefault(c => IsPlayerContributor(c, account, backup.UserName));
+        if(contributor is not null) {
+            rates.Add(new PlayerContractRate(statusLookup.ContractId, contributor.ContributionRate * 3600, contributor.ContributionAmount));
+            if(rates.Count == 3) {
+                break;
+            }
+        }
+    }
+
     foreach(var contract in contracts) {
+        if(rates.Any(r => string.Equals(r.ContractId, contract.ContractId, StringComparison.OrdinalIgnoreCase))) {
+            continue;
+        }
+
         var status = await eggClient.GetCoopStatusAsync(contract.ContractId, contract.CoopCode);
         var contributor = status?.Contributors.FirstOrDefault(c => IsPlayerContributor(c, account, backup.UserName));
         if(contributor is not null) {
@@ -1772,6 +2371,29 @@ async Task<Embed> BuildPlayerEmbedAsync(RegisteredEggAccount account, string dis
     return builder.Build();
 }
 
+static IReadOnlyList<PlayerContractCandidate> BuildPlayerRateCandidates(Backup backup) {
+    if(backup.Contracts is null) {
+        return [];
+    }
+
+    var localCandidates = backup.Contracts.Contracts
+        .Concat(backup.Contracts.Archive)
+        .Where(c => !c.Cancelled)
+        .Select(c => new PlayerContractCandidate(GetLocalContractId(c), c.CoopIdentifier, c.TimeAccepted));
+
+    var embeddedCandidates = backup.Contracts.CurrentCoopStatuses
+        .Where(s => !string.IsNullOrWhiteSpace(s.ContractIdentifier) && !string.IsNullOrWhiteSpace(s.CoopIdentifier))
+        .Select(s => new PlayerContractCandidate(s.ContractIdentifier, s.CoopIdentifier, 0));
+
+    return localCandidates
+        .Concat(embeddedCandidates)
+        .Where(c => !string.IsNullOrWhiteSpace(c.ContractId) && !string.IsNullOrWhiteSpace(c.CoopCode))
+        .GroupBy(c => (ContractId: c.ContractId.ToLowerInvariant(), CoopCode: c.CoopCode.ToLowerInvariant()))
+        .Select(g => g.OrderByDescending(c => c.AcceptedAt).First())
+        .OrderByDescending(c => c.AcceptedAt)
+        .ToList();
+}
+
 MessageComponent BuildPlayerComponents(ulong discordUserId) =>
     new ComponentBuilder()
         .WithButton("Refresh", $"player-refresh:{discordUserId}", ButtonStyle.Primary)
@@ -1792,45 +2414,16 @@ async Task<DashboardResult> BuildDashboardAsync(ulong guildId) {
         .GroupBy(a => NormalizeName(a.EggName), StringComparer.OrdinalIgnoreCase)
         .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
 
-    var now = DateTimeOffset.UtcNow;
-    var recentContractIds = (await eggClient.GetCurrentContractsAsync())
-        .Where(c => !string.IsNullOrWhiteSpace(c.Identifier))
-        .Where(c => c.StartTime > 0)
-        .Where(c => DateTimeOffset.FromUnixTimeSeconds((long)c.StartTime) >= now.AddDays(-3))
-        .Where(c => c.ExpirationTime <= 0 || DateTimeOffset.FromUnixTimeSeconds((long)c.ExpirationTime) > now)
-        .Select(c => c.Identifier)
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    if(recentContractIds.Count == 0) {
+    var statusResult = await GetRecentRegisteredStatusesAsync(accounts);
+    if(statusResult.RecentContractCount == 0) {
         return new DashboardResult("I could not find any active contracts released in the past 3 days.", [], []);
     }
 
-    var statuses = new Dictionary<(string ContractId, string CoopCode), ContractCoopStatusResponse>();
-    var failed = 0;
-    var skippedOldContracts = 0;
-    foreach(var account in accounts) {
-        var lookup = await eggClient.GetPlayerCoopLookupAsync(account.Eid);
-        if(lookup.Statuses.Count == 0) {
-            failed++;
-            continue;
-        }
-
-        foreach(var status in lookup.Statuses) {
-            if(!recentContractIds.Contains(status.ContractId)) {
-                skippedOldContracts++;
-                continue;
-            }
-
-            var key = (status.ContractId.ToLowerInvariant(), status.CoopCode.ToLowerInvariant());
-            statuses.TryAdd(key, status.Status);
-        }
-
-    }
-
-    if(statuses.Count == 0) {
+    if(statusResult.Statuses.Count == 0) {
         return new DashboardResult($"I checked `{accounts.Count}` registered EID(s), but none had active dashboard data for contracts released in the past 3 days.", [], []);
     }
 
-    var rows = BuildDashboardRows(statuses.Values, registeredByEggId, registeredByName);
+    var rows = BuildDashboardRows(statusResult.Statuses.Values, registeredByEggId, registeredByName);
     var embeds = rows
         .GroupBy(r => r.ContractId, StringComparer.OrdinalIgnoreCase)
         .OrderBy(g => g.Key)
@@ -1839,11 +2432,11 @@ async Task<DashboardResult> BuildDashboardAsync(ulong guildId) {
         .ToList();
 
     var attention = rows.Count(r => r.Category != DashboardCategory.Healthy);
-    var message = failed > 0
-        ? $"Dashboard for contracts released in the past 3 days across `{accounts.Count}` registered EID(s). `{failed}` EID(s) did not return active co-op data. `{attention}` player issue(s) need attention."
+    var message = statusResult.Failed > 0
+        ? $"Dashboard for contracts released in the past 3 days across `{accounts.Count}` registered EID(s). `{statusResult.Failed}` EID(s) did not return active co-op data. `{attention}` player issue(s) need attention."
         : $"Dashboard for contracts released in the past 3 days across `{accounts.Count}` registered EID(s). `{attention}` player issue(s) need attention.";
-    if(skippedOldContracts > 0) {
-        message += $" Skipped `{skippedOldContracts}` older active co-op lookup(s).";
+    if(statusResult.SkippedOldContracts > 0) {
+        message += $" Skipped `{statusResult.SkippedOldContracts}` older active co-op lookup(s).";
     }
 
     return new DashboardResult(message, embeds, rows);
@@ -2005,6 +2598,291 @@ static string DisplayNameForDemerits(SocketGuild? guild, ulong userId) {
     var user = guild?.GetUser(userId);
     return user is null ? $"<@{userId}>" : user.Mention;
 }
+
+SocketGuildUser? ResolveGuildMemberOption(SocketSlashCommand command, string optionName) {
+    var user = command.Data.Options.FirstOrDefault(o => o.Name == optionName)?.Value as IUser;
+    if(user is null || command.GuildId is null) {
+        return null;
+    }
+
+    return client.GetGuild(command.GuildId.Value)?.GetUser(user.Id);
+}
+
+static IReadOnlyList<Embed> BuildMemberRegistrationEmbeds(
+    SocketGuild guild,
+    IReadOnlyList<SocketGuildUser> registeredMembers,
+    IReadOnlyList<SocketGuildUser> unregisteredMembers,
+    IReadOnlyList<KeyValuePair<ulong, List<RegisteredEggAccount>>> orphanedRegistrations,
+    IReadOnlyDictionary<ulong, List<RegisteredEggAccount>> registeredByUser,
+    IReadOnlyList<Egg9000LeaderboardItem>? egg9000Members = null) {
+    var embeds = new List<Embed>();
+    AddMemberSection(
+        embeds,
+        "Registered Members",
+        registeredMembers.Select(member => FormatRegisteredMemberLine(member, registeredByUser[member.Id])),
+        Color.Green);
+    AddMemberSection(
+        embeds,
+        "Not Registered",
+        unregisteredMembers.Select(FormatUnregisteredMemberLine),
+        Color.Orange);
+
+    if(orphanedRegistrations.Count > 0) {
+        AddMemberSection(
+            embeds,
+            "Registered But Not In Server Cache",
+            orphanedRegistrations.Select(kvp => FormatOrphanedRegistrationLine(kvp.Key, kvp.Value)),
+            Color.DarkGrey);
+    }
+
+    if(egg9000Members is { Count: > 0 }) {
+        var egg9000ByDiscordId = egg9000Members
+            .Where(m => m.DiscordId != 0)
+            .GroupBy(m => m.DiscordId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+        AddMemberSection(
+            embeds,
+            "E9K Roster Not Registered With Plotty",
+            egg9000ByDiscordId
+                .Where(kvp => !registeredByUser.ContainsKey(kvp.Key))
+                .OrderBy(kvp => DiscordAccountSortNameOrEmpty(guild.GetUser(kvp.Key)), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(kvp => kvp.Key)
+                .Select(kvp => FormatEgg9000MemberLine(guild.GetUser(kvp.Key), kvp.Key, kvp.Value)),
+            Color.Blue);
+        AddMemberSection(
+            embeds,
+            "Plotty Registered Not Found In E9K Roster",
+            registeredMembers
+                .Where(member => !egg9000ByDiscordId.ContainsKey(member.Id))
+                .OrderBy(DiscordAccountSortName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(member => member.Id)
+                .Select(member => FormatRegisteredMemberLine(member, registeredByUser[member.Id])),
+            Color.Purple);
+    }
+
+    return embeds.Count == 0
+        ? [new EmbedBuilder()
+            .WithTitle("Member Registration List")
+            .WithDescription("No members found.")
+            .WithColor(Color.LightGrey)
+            .WithCurrentTimestamp()
+            .Build()]
+        : embeds;
+
+    static void AddMemberSection(
+        List<Embed> target,
+        string title,
+        IEnumerable<string> sourceLines,
+        Color color) {
+        var lines = sourceLines.ToList();
+        if(lines.Count == 0) {
+            lines.Add("None");
+        }
+
+        var page = 1;
+        var current = new List<string>();
+        var currentLength = 0;
+        foreach(var line in lines) {
+            var nextLength = currentLength + line.Length + 1;
+            if(current.Count > 0 && nextLength > 3200) {
+                target.Add(BuildMemberSectionEmbed(title, page++, current, color));
+                current = [];
+                currentLength = 0;
+            }
+
+            current.Add(line);
+            currentLength += line.Length + 1;
+        }
+
+        if(current.Count > 0) {
+            target.Add(BuildMemberSectionEmbed(title, page, current, color));
+        }
+    }
+
+    static Embed BuildMemberSectionEmbed(string title, int page, IReadOnlyList<string> lines, Color color) =>
+        new EmbedBuilder()
+            .WithTitle(page == 1 ? title : $"{title} ({page})")
+            .WithColor(color)
+            .WithDescription(string.Join("\n", lines))
+            .WithFooter("EIDs are not shown in this report.")
+            .WithCurrentTimestamp()
+            .Build();
+
+    static string FormatRegisteredMemberLine(SocketGuildUser member, IReadOnlyList<RegisteredEggAccount> accounts) {
+        var accountNames = accounts
+            .Select(a => string.IsNullOrWhiteSpace(a.EggName) ? "unnamed Egg Inc account" : a.EggName!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(4)
+            .ToList();
+        var extra = accounts.Count > accountNames.Count ? $", +{accounts.Count - accountNames.Count} more" : "";
+        return $"- {MemberLabel(member)} - `{accounts.Count}` account(s): {string.Join(", ", accountNames)}{extra}";
+    }
+
+    static string FormatUnregisteredMemberLine(SocketGuildUser member) =>
+        $"- {MemberLabel(member)}";
+
+    static string FormatOrphanedRegistrationLine(ulong userId, IReadOnlyList<RegisteredEggAccount> accounts) =>
+        $"- User ID `{userId}` - `{accounts.Count}` registered account(s)";
+
+    static string FormatEgg9000MemberLine(SocketGuildUser? member, ulong userId, IReadOnlyList<Egg9000LeaderboardItem> accounts) {
+        var names = accounts
+            .Select(a => string.IsNullOrWhiteSpace(a.EggIncName) ? "unnamed Egg Inc account" : a.EggIncName!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(4)
+            .ToList();
+        var extra = accounts.Count > names.Count ? $", +{accounts.Count - names.Count} more" : "";
+        var label = member is null ? $"User ID `{userId}`" : MemberLabel(member);
+        return $"- {label} - `{accounts.Count}` E9K account(s): {string.Join(", ", names)}{extra}";
+    }
+
+    static string MemberLabel(SocketGuildUser member) {
+        var username = string.IsNullOrWhiteSpace(member.GlobalName)
+            ? member.Username
+            : member.GlobalName;
+        return $"{member.DisplayName} (`{username}`)";
+    }
+}
+
+static IReadOnlyList<Embed> BuildE9kCompareEmbeds(
+    SocketGuild guild,
+    IReadOnlyList<SocketGuildUser> inBoth,
+    IReadOnlyList<KeyValuePair<ulong, List<Egg9000LeaderboardItem>>> e9kOnly,
+    IReadOnlyList<SocketGuildUser> discordOnly,
+    IReadOnlyDictionary<ulong, List<Egg9000LeaderboardItem>> egg9000ByDiscordId) {
+    var embeds = new List<Embed>();
+    AddSection(
+        embeds,
+        "In Discord And EGG9000",
+        inBoth.Select(member => FormatE9kDiscordMemberLine(member, egg9000ByDiscordId[member.Id])),
+        Color.Green);
+    AddSection(
+        embeds,
+        "In EGG9000 But Not Discord",
+        e9kOnly.Select(kvp => FormatE9kOnlyLine(kvp.Key, kvp.Value)),
+        Color.Orange);
+    AddSection(
+        embeds,
+        "In Discord But Not EGG9000",
+        discordOnly.Select(member => $"- {MemberLabel(member)}"),
+        Color.Red);
+
+    return embeds;
+
+    static void AddSection(List<Embed> target, string title, IEnumerable<string> sourceLines, Color color) {
+        var lines = sourceLines.ToList();
+        if(lines.Count == 0) {
+            lines.Add("None");
+        }
+
+        var page = 1;
+        var current = new List<string>();
+        var currentLength = 0;
+        foreach(var line in lines) {
+            var nextLength = currentLength + line.Length + 1;
+            if(current.Count > 0 && nextLength > 3200) {
+                target.Add(BuildSectionEmbed(title, page++, current, color));
+                current = [];
+                currentLength = 0;
+            }
+
+            current.Add(line);
+            currentLength += line.Length + 1;
+        }
+
+        if(current.Count > 0) {
+            target.Add(BuildSectionEmbed(title, page, current, color));
+        }
+    }
+
+    static Embed BuildSectionEmbed(string title, int page, IReadOnlyList<string> lines, Color color) =>
+        new EmbedBuilder()
+            .WithTitle(page == 1 ? title : $"{title} ({page})")
+            .WithColor(color)
+            .WithDescription(string.Join("\n", lines))
+            .WithFooter("EGG9000 comparison uses Discord ID matching.")
+            .WithCurrentTimestamp()
+            .Build();
+
+    static string FormatE9kDiscordMemberLine(SocketGuildUser member, IReadOnlyList<Egg9000LeaderboardItem> accounts) =>
+        $"- {MemberLabel(member)} - {FormatE9kAccounts(accounts)}";
+
+    static string FormatE9kOnlyLine(ulong discordId, IReadOnlyList<Egg9000LeaderboardItem> accounts) =>
+        $"- User ID `{discordId}` - {FormatE9kAccounts(accounts)}";
+
+    static string FormatE9kAccounts(IReadOnlyList<Egg9000LeaderboardItem> accounts) {
+        var names = accounts
+            .Select(a => string.IsNullOrWhiteSpace(a.EggIncName) ? "unnamed Egg Inc account" : a.EggIncName!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(4)
+            .ToList();
+        var extra = accounts.Count > names.Count ? $", +{accounts.Count - names.Count} more" : "";
+        return $"`{accounts.Count}` E9K account(s): {string.Join(", ", names)}{extra}";
+    }
+
+    static string MemberLabel(SocketGuildUser member) {
+        var username = string.IsNullOrWhiteSpace(member.GlobalName)
+            ? member.Username
+            : member.GlobalName;
+        return $"{member.DisplayName} (`{username}`)";
+    }
+}
+
+async Task<IReadOnlyList<SocketGuildUser>> GetUnregisteredHumanMembersAsync(SocketGuild guild, string logContext) {
+    try {
+        await guild.DownloadUsersAsync();
+    } catch(Exception ex) {
+        Console.WriteLine($"Could not refresh guild users for {logContext}: {ex.Message}");
+    }
+
+    var registeredAccounts = await dataStore.GetRegisteredEidsAsync(guild.Id);
+    var registeredUserIds = registeredAccounts
+        .Select(a => a.DiscordUserId)
+        .ToHashSet();
+
+    return guild.Users
+        .Where(u => !u.IsBot)
+        .Where(u => !registeredUserIds.Contains(u.Id))
+        .OrderBy(DiscordAccountSortName, StringComparer.OrdinalIgnoreCase)
+        .ThenBy(u => u.Id)
+        .ToList();
+}
+
+static IReadOnlyList<string> BuildMentionChunks(string message, IEnumerable<ulong> userIds, int maxLength) {
+    var chunks = new List<string>();
+    var current = message.Trim();
+    foreach(var userId in userIds) {
+        var mention = $"<@{userId}>";
+        var candidate = $"{current} {mention}";
+        if(candidate.Length > maxLength) {
+            chunks.Add(current);
+            current = mention;
+            continue;
+        }
+
+        current = candidate;
+    }
+
+    if(!string.IsNullOrWhiteSpace(current)) {
+        chunks.Add(current);
+    }
+
+    return chunks;
+}
+
+static string DiscordAccountSortName(SocketGuildUser member) =>
+    string.IsNullOrWhiteSpace(member.GlobalName)
+        ? member.Username
+        : member.GlobalName;
+
+static string DiscordAccountSortNameOrEmpty(SocketGuildUser? member) =>
+    member is null
+        ? ""
+        : DiscordAccountSortName(member);
+
+static string E9kSortName(IReadOnlyList<Egg9000LeaderboardItem> accounts) =>
+    accounts
+        .Select(a => string.IsNullOrWhiteSpace(a.DiscordName) ? a.EggIncName : a.DiscordName)
+        .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? "";
 
 bool HasStaffRole(SocketGuildUser user) =>
     IsPlottyAdmin(user) ||
@@ -2345,7 +3223,10 @@ static string ShipDisplayName(MissionInfo.Types.Spaceship ship) => ship switch {
 static string HumanizeEnum<T>(T value) where T : struct, Enum =>
     Regex.Replace(value.ToString(), "([a-z0-9])([A-Z])", "$1 $2");
 
-Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) {
+Embed BuildContractArtifactsEmbed(
+    Backup? backup,
+    RegisteredEggAccount account,
+    CoopArtifactContext? coopContext) {
     var titleName = AccountDisplayName(account);
     var builder = new EmbedBuilder()
         .WithTitle($"Contract Artifacts - {titleName}")
@@ -2375,7 +3256,7 @@ Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) 
     var activeArtifacts = GetActiveContractArtifacts(backup, candidates, currentFarmIndexes)
         .ToList();
     var stoneOptions = BuildStoneOptions(backup.ArtifactsDb.InventoryItems);
-    var suggestions = BuildArtifactRecommendations(availableCandidates, stoneOptions, activeArtifacts)
+    var suggestions = BuildArtifactRecommendations(availableCandidates, stoneOptions, activeArtifacts, coopContext)
         .ToList();
     var bestSuggestion = suggestions
         .OrderByDescending(s => s.Score)
@@ -2397,20 +3278,28 @@ Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) 
             .Take(8)
             .ToList();
 
-    builder.WithDescription("Plotty evaluated your current contract inventory using EGG9000 artifact data, including stone slots, image names, and effect values.");
+    builder.WithDescription("Plotty evaluated your current contract inventory against the latest co-op artifact and production reports available from Egg Inc.");
     builder.AddField("Current Contract Farm", string.Join("\n", contractLines));
     builder.AddField("Currently Equipped", string.Join("\n", equippedLines));
+    builder.AddField("Co-op Artifact Support", BuildCoopArtifactSummary(coopContext));
 
     if(bestSuggestion is null || bestSuggestion.Set.Count == 0) {
         builder.AddField("Suggested Set", "No complete contract-focused artifact set could be built. Look for Tachyon Deflector, Quantum Metronome, Interstellar Compass, and Tachyon/Quantum stones.");
     } else {
         builder.AddField($"Best Set - {bestSuggestion.Label}", FormatArtifactSet(bestSuggestion.Set));
+        var bestEvaluation = CoopArtifactAnalyzer.EvaluateSet(coopContext, activeArtifacts, bestSuggestion.Set);
+        if(bestEvaluation.UsesLiveProduction) {
+            builder.AddField(
+                "Estimated Result",
+                $"Player bottleneck: **{FormatEggs(Math.Min(bestEvaluation.PlayerLayingRate, bestEvaluation.PlayerShippingRate) * 3600)}/hr** ({FormatRatioChange(bestEvaluation.PlayerOutputRatio)})\n" +
+                $"Total reporting co-op output: **{FormatRatioChange(bestEvaluation.CoopOutputRatio)}**");
+        }
 
         var alternatives = suggestions
             .Where(s => !ReferenceEquals(s, bestSuggestion) && s.Set.Count > 0)
             .OrderByDescending(s => s.Score)
             .Take(3)
-            .Select(s => $"**{s.Label}** - {FormatArtifactSetOneLine(s.Set)}")
+            .Select(s => $"**{s.Label}** - {FormatArtifactSetOneLine(s.Set, activeArtifacts, coopContext)}")
             .ToList();
         if(alternatives.Count > 0) {
             builder.AddField("Other EGG9000-Style Checks", string.Join("\n", alternatives));
@@ -2426,7 +3315,10 @@ Embed BuildContractArtifactsEmbed(Backup? backup, RegisteredEggAccount account) 
         }
     }
 
-    builder.WithFooter($"Data: EGG9000 eiafx-data.json. Recognized {availableCandidates.Select(c => c.Name).Distinct().Count()} artifact families and {stoneOptions.Count} loose laying/shipping stones.");
+    var coopReportFooter = coopContext is null
+        ? "Co-op artifact status unavailable."
+        : $"Co-op artifact reports: {coopContext.ReportingMemberCount}/{coopContext.Members.Count}.";
+    builder.WithFooter($"Data: Egg Inc co-op status and EGG9000 eiafx-data.json. {coopReportFooter} Recognized {availableCandidates.Select(c => c.Name).Distinct().Count()} artifact families and {stoneOptions.Count} loose laying/shipping stones.");
     return builder.Build();
 }
 
@@ -2538,6 +3430,27 @@ static IReadOnlyList<ContractFarmSnapshot> GetCurrentContractFarms(Backup backup
         .ToList();
 }
 
+static ContractCoopStatusResponse? FindCurrentCoopStatus(
+    Backup? backup,
+    PlayerCoopLookupResult lookup) {
+    if(backup is null) {
+        return null;
+    }
+
+    var currentContractId = GetCurrentContractFarms(backup)
+        .Select(snapshot => snapshot.Farm.ContractId)
+        .FirstOrDefault();
+    if(string.IsNullOrWhiteSpace(currentContractId)) {
+        return null;
+    }
+
+    return lookup.StatusLookups
+        .Where(status => string.Equals(status.ContractId, currentContractId, StringComparison.OrdinalIgnoreCase))
+        .OrderByDescending(status => status.AcceptedAt)
+        .Select(status => status.Status)
+        .FirstOrDefault();
+}
+
 static IEnumerable<ArtifactCandidate> GetActiveContractArtifacts(
     Backup backup,
     IReadOnlyList<ArtifactCandidate> candidates,
@@ -2591,32 +3504,33 @@ static IReadOnlyList<ArtifactCandidate> BuildAvailableArtifactCandidates(
 static IEnumerable<ArtifactSetSuggestion> BuildArtifactRecommendations(
     IReadOnlyList<ArtifactCandidate> candidates,
     IReadOnlyList<StoneOption> stones,
-    IReadOnlyList<ArtifactCandidate> currentSet) {
+    IReadOnlyList<ArtifactCandidate> currentSet,
+    CoopArtifactContext? coopContext) {
     var fixedStonePool = BuildRecommendationPool(candidates);
     var changedStonePool = BuildRecommendationPool(ExpandWithStoneOptions(candidates, stones));
 
-    var noDeflector = BuildBestArtifactSet(fixedStonePool, requireDeflector: false, currentSet);
+    var noDeflector = BuildBestArtifactSet(fixedStonePool, requireDeflector: false, currentSet, coopContext);
     if(noDeflector.Count > 0) {
-        yield return new ArtifactSetSuggestion("No Deflector", noDeflector, ArtifactSetScore(noDeflector));
+        yield return new ArtifactSetSuggestion("No Deflector", noDeflector, ArtifactSetScore(noDeflector, currentSet, coopContext));
     }
 
-    var withDeflector = BuildBestArtifactSet(fixedStonePool, requireDeflector: true, currentSet);
+    var withDeflector = BuildBestArtifactSet(fixedStonePool, requireDeflector: true, currentSet, coopContext);
     if(withDeflector.Count > 0) {
-        yield return new ArtifactSetSuggestion("With Deflector", withDeflector, ArtifactSetScore(withDeflector));
+        yield return new ArtifactSetSuggestion("With Deflector", withDeflector, ArtifactSetScore(withDeflector, currentSet, coopContext));
     }
 
     if(stones.Count == 0) {
         yield break;
     }
 
-    var noDeflectorChanged = BuildBestArtifactSet(changedStonePool, requireDeflector: false, currentSet);
+    var noDeflectorChanged = BuildBestArtifactSet(changedStonePool, requireDeflector: false, currentSet, coopContext);
     if(noDeflectorChanged.Count > 0) {
-        yield return new ArtifactSetSuggestion("No Deflector, changing stones", noDeflectorChanged, ArtifactSetScore(noDeflectorChanged));
+        yield return new ArtifactSetSuggestion("No Deflector, changing stones", noDeflectorChanged, ArtifactSetScore(noDeflectorChanged, currentSet, coopContext));
     }
 
-    var withDeflectorChanged = BuildBestArtifactSet(changedStonePool, requireDeflector: true, currentSet);
+    var withDeflectorChanged = BuildBestArtifactSet(changedStonePool, requireDeflector: true, currentSet, coopContext);
     if(withDeflectorChanged.Count > 0) {
-        yield return new ArtifactSetSuggestion("With Deflector, changing stones", withDeflectorChanged, ArtifactSetScore(withDeflectorChanged));
+        yield return new ArtifactSetSuggestion("With Deflector, changing stones", withDeflectorChanged, ArtifactSetScore(withDeflectorChanged, currentSet, coopContext));
     }
 }
 
@@ -2636,7 +3550,8 @@ static IReadOnlyList<ArtifactCandidate> BuildRecommendationPool(IEnumerable<Arti
 static IReadOnlyList<ArtifactCandidate> BuildBestArtifactSet(
     IReadOnlyList<ArtifactCandidate> pool,
     bool requireDeflector,
-    IReadOnlyList<ArtifactCandidate> currentSet) {
+    IReadOnlyList<ArtifactCandidate> currentSet,
+    CoopArtifactContext? coopContext) {
     if(pool.Count == 0) {
         return [];
     }
@@ -2662,15 +3577,18 @@ static IReadOnlyList<ArtifactCandidate> BuildBestArtifactSet(
         .Where(s => requireDeflector
             ? s.Any(a => a.Purpose == ArtifactPurpose.TeamLaying)
             : s.All(a => a.Purpose != ArtifactPurpose.TeamLaying))
-        .OrderByDescending(s => {
-            var score = ScoreLayingSet(s);
-            return Math.Min(score.Laying, score.Shipping) * (1 + score.Deflector);
-        })
-        .ThenByDescending(s => ScoreLayingSet(s).Laying * ScoreLayingSet(s).Shipping)
-        .ThenByDescending(s => ScoreLayingSet(s).Deflector)
-        .ThenByDescending(s => s.Count(a => a.Purpose is ArtifactPurpose.TeamLaying or ArtifactPurpose.Laying or ArtifactPurpose.Shipping))
-        .ThenByDescending(s => s.Sum(ArtifactCandidateStrength))
-        .ThenByDescending(s => s.Sum(ArtifactQualityScore))
+        .Select(s => (
+            Set: s,
+            Evaluation: CoopArtifactAnalyzer.EvaluateSet(coopContext, currentSet, s),
+            Multipliers: ScoreLayingSet(s)))
+        .OrderByDescending(s => s.Evaluation.Score)
+        .ThenByDescending(s => Math.Min(s.Multipliers.Laying, s.Multipliers.Shipping))
+        .ThenByDescending(s => s.Multipliers.Laying * s.Multipliers.Shipping)
+        .ThenByDescending(s => s.Multipliers.Deflector)
+        .ThenByDescending(s => s.Set.Count(a => a.Purpose is ArtifactPurpose.TeamLaying or ArtifactPurpose.Laying or ArtifactPurpose.Shipping))
+        .ThenByDescending(s => s.Set.Sum(ArtifactCandidateStrength))
+        .ThenByDescending(s => s.Set.Sum(ArtifactQualityScore))
+        .Select(s => (IReadOnlyList<ArtifactCandidate>)s.Set)
         .FirstOrDefault() ?? [];
 
     void BuildSets(int start, List<ArtifactCandidate> current) {
@@ -2679,7 +3597,7 @@ static IReadOnlyList<ArtifactCandidate> BuildBestArtifactSet(
             return;
         }
 
-        if(current.Count + (pool.Count - start) < targetSetSize) {
+        if(current.Count + (searchPool.Count - start) < targetSetSize) {
             return;
         }
 
@@ -2784,10 +3702,11 @@ static (double Laying, double Shipping, double Deflector) ScoreLayingSet(IReadOn
         set.Sum(current => current.DeflectorBonus)
     );
 
-static double ArtifactSetScore(IReadOnlyList<ArtifactCandidate> set) {
-    var score = ScoreLayingSet(set);
-    return Math.Min(score.Laying, score.Shipping) * (1 + score.Deflector);
-}
+static double ArtifactSetScore(
+    IReadOnlyList<ArtifactCandidate> set,
+    IReadOnlyList<ArtifactCandidate> currentSet,
+    CoopArtifactContext? coopContext) =>
+    CoopArtifactAnalyzer.EvaluateSet(coopContext, currentSet, set).Score;
 
 static int ArtifactPurposePriority(ArtifactPurpose purpose) =>
     purpose switch {
@@ -2904,10 +3823,58 @@ static string FormatArtifactSet(IReadOnlyList<ArtifactCandidate> set) =>
     string.Join("\n", set.Select((a, i) =>
         $"{i + 1}. {ArtifactPurposeIcon(a.Purpose)} **{a.DisplayName}**{FormatArtifactStoneList(a.Stones)} - {FormatArtifactMultiplier(a)}{(a.StonesChanged ? "; change stones" : $"; {a.Reason}")}"));
 
-static string FormatArtifactSetOneLine(IReadOnlyList<ArtifactCandidate> set) {
-    var score = ScoreLayingSet(set);
-    return $"{Math.Min(score.Laying, score.Shipping):0.###}x bottleneck, {score.Deflector:P0} deflector | " +
-           string.Join(", ", set.Select(a => a.DisplayName + (a.StonesChanged ? "*" : "")));
+static string FormatArtifactSetOneLine(
+    IReadOnlyList<ArtifactCandidate> set,
+    IReadOnlyList<ArtifactCandidate> currentSet,
+    CoopArtifactContext? coopContext) {
+    var evaluation = CoopArtifactAnalyzer.EvaluateSet(coopContext, currentSet, set);
+    var multipliers = ScoreLayingSet(set);
+    var scoreText = evaluation.UsesLiveProduction
+        ? $"{FormatRatioChange(evaluation.CoopOutputRatio)} estimated co-op output"
+        : $"{Math.Min(multipliers.Laying, multipliers.Shipping):0.###}x bottleneck";
+    return scoreText + " | " + string.Join(", ", set.Select(a => a.DisplayName + (a.StonesChanged ? "*" : "")));
+}
+
+static string BuildCoopArtifactSummary(CoopArtifactContext? context) {
+    if(context is null) {
+        return "Current co-op artifact details were unavailable. Suggestions use the player's synced inventory only.";
+    }
+
+    var lines = new List<string> {
+        $"Artifact reports: **{context.ReportingMemberCount}/{context.Members.Count}** members",
+        $"Live production reports: **{context.LiveProductionMemberCount}/{context.Members.Count}** members",
+        $"Teammate Deflectors: **{context.TeammateDeflectorCount}** ({FormatArtifactBonus(context.TeammateDeflectorBonus)} laying)",
+        $"Teammate Ships in a Bottle: **{context.TeammateEarningsArtifactCount}** ({FormatArtifactBonus(context.TeammateEarningsBonus)} earnings)"
+    };
+
+    var player = context.RequestingPlayer;
+    if(player is null) {
+        lines.Add("Your contributor row could not be matched, so live co-op scoring is unavailable.");
+    } else if(player.EggLayingRate > 0 && player.ShippingRate > 0) {
+        var bottleneck = player.EggLayingRate > player.ShippingRate * 1.03
+            ? "shipping"
+            : player.ShippingRate > player.EggLayingRate * 1.03
+                ? "egg laying"
+                : "balanced";
+        lines.Add($"Current player bottleneck: **{bottleneck}**");
+    }
+
+    if(context.MissingReportCount > 0) {
+        lines.Add($"{context.MissingReportCount} member(s) have not synced farm artifact details yet.");
+    }
+
+    return string.Join("\n", lines);
+}
+
+static string FormatArtifactBonus(double bonus) => $"+{Math.Max(0, bonus) * 100:0.#}%";
+
+static string FormatRatioChange(double ratio) {
+    var percent = (ratio - 1) * 100;
+    return percent > 0.05
+        ? $"+{percent:0.#}%"
+        : percent < -0.05
+            ? $"{percent:0.#}%"
+            : "no material change";
 }
 
 static string GetString(SocketSlashCommand command, string name) =>
@@ -2916,14 +3883,13 @@ static string GetString(SocketSlashCommand command, string name) =>
 static bool GetBool(SocketSlashCommand command, string name) =>
     command.Data.Options.FirstOrDefault(o => o.Name == name)?.Value is bool value && value;
 
-static string TrimForDiscordName(string value) {
-    var cleaned = Regex.Replace(value.ToLowerInvariant(), @"[^a-z0-9\-_ ]", "").Trim();
-    cleaned = Regex.Replace(cleaned, @"\s+", "-");
+static string TrimForDiscordThreadName(string value) {
+    var cleaned = Regex.Replace(value, @"\s+", " ").Trim();
     if(string.IsNullOrWhiteSpace(cleaned)) {
-        return "plotty-alert";
+        return "Plotty report";
     }
 
-    return cleaned.Length <= 90 ? cleaned : cleaned[..90].Trim('-');
+    return cleaned.Length <= 90 ? cleaned : cleaned[..90].Trim();
 }
 
 static string FormatDuration(TimeSpan duration) {
@@ -2941,7 +3907,7 @@ static string FormatDuration(TimeSpan duration) {
     return hours > 0 ? $"{hours}h" : $"{minutes}m";
 }
 
-static string PubTitle(int beersReceived) {
+static string TownTitle(int beersReceived) {
     return beersReceived switch {
         >= 100 => "Basically live here",
         >= 50 => "Patron",
@@ -2950,67 +3916,18 @@ static string PubTitle(int beersReceived) {
     };
 }
 
-static string PubMilestoneMessage(int beersReceived, string mention) {
+static string TownMilestoneMessage(int beersReceived, string mention) {
     return beersReceived switch {
-        10 => $"{mention} is now a **Local** at the pub.",
-        50 => $"{mention} is now a **Patron** at the pub.",
+        10 => $"{mention} is now a **Local** in town.",
+        50 => $"{mention} is now a **Patron** in town.",
         100 => $"{mention} **Basically live here** now.",
         _ => ""
     };
 }
 
-async Task<string> BuildPlottyConversationResponseAsync(
-    ulong guildId,
-    ulong userId,
-    string mention,
-    string prompt,
-    bool isQuestion,
-    PlottyMemory memory) {
-    var cleaned = Regex.Replace(prompt, @"\s+", " ").Trim();
-    var normalized = cleaned.ToLowerInvariant();
-    var previous = await dataStore.GetPlottyConversationAsync(guildId, userId);
-
-    if(string.IsNullOrWhiteSpace(cleaned)) {
-        await dataStore.RecordPlottyConversationAsync(guildId, userId, "summon");
-        return PlottyPersonality.MentionResponse(mention, isQuestion: false, memory);
-    }
-
-    if(IsGreeting(normalized)) {
-        await dataStore.RecordPlottyConversationAsync(guildId, userId, "greeting");
-        return $"{mention} {PlottyPersonality.ConversationGreeting(memory)}";
-    }
-
-    if(IsThanks(normalized)) {
-        await dataStore.RecordPlottyConversationAsync(guildId, userId, "thanks");
-        return $"{mention} {PlottyPersonality.ConversationThanks(memory)}";
-    }
-
-    var plottyAnswer = TryAnswerPlottyQuestion(normalized);
-    if(plottyAnswer is not null) {
-        var answer = plottyAnswer.Value;
-        await dataStore.RecordPlottyConversationAsync(guildId, userId, answer.Topic);
-        return $"{mention} {PlottyPersonality.ConversationLeadIn(memory)}{answer.Answer}";
-    }
-
-    if(NeedsPreviousTopic(normalized) && previous is not null && !string.IsNullOrWhiteSpace(previous.LastTopic)) {
-        await dataStore.RecordPlottyConversationAsync(guildId, userId, previous.LastTopic);
-        return $"{mention} {PlottyPersonality.ConversationLeadIn(memory)}If you mean **{previous.LastTopic}**, I still have that context. Ask the next part with one specific detail and I will keep following it.";
-    }
-
-    if(isQuestion && LooksLikeEggIncQuestion(normalized)) {
-        var answer = await wikiClient.AnswerAsync(cleaned);
-        if(answer is not null) {
-            await dataStore.RecordPlottyConversationAsync(guildId, userId, answer.Title);
-            return $"{mention} {PlottyPersonality.ConversationLeadIn(memory)}**{answer.Title}:** {TrimDiscordMessage(answer.Answer, 1300)}\nSource: {answer.Url}";
-        }
-    }
-
-    var inferredTopic = InferConversationTopic(normalized);
-    await dataStore.RecordPlottyConversationAsync(guildId, userId, inferredTopic);
-    return isQuestion
-        ? $"{mention} {PlottyPersonality.ConversationUnknownQuestion(memory, previous?.LastTopic)}"
-        : $"{mention} {PlottyPersonality.ConversationSmallTalk(memory, inferredTopic)}";
-}
+static bool IsCooldownLimitedBeverage(string drink) =>
+    drink.Equals("Beer", StringComparison.OrdinalIgnoreCase) ||
+    drink.Equals("Wine", StringComparison.OrdinalIgnoreCase);
 
 static string StripBotMention(string content) =>
     Regex.Replace(content, @"<@!?\d+>", "", RegexOptions.Compiled).Trim();
@@ -3031,91 +3948,34 @@ static string? ExtractLateNoticeContractId(string content) {
     return taggedMatch.Success ? taggedMatch.Groups["id"].Value : null;
 }
 
-static bool IsGreeting(string normalized) =>
-    Regex.IsMatch(normalized, @"\b(hi|hello|hey|yo|sup|good morning|good evening|good afternoon)\b", RegexOptions.IgnoreCase);
-
-static bool IsThanks(string normalized) =>
-    Regex.IsMatch(normalized, @"\b(thanks|thank you|ty|appreciate it|good bot)\b", RegexOptions.IgnoreCase);
-
-static bool NeedsPreviousTopic(string normalized) =>
-    Regex.IsMatch(normalized, @"\b(that|it|those|them|this|previous|same thing)\b", RegexOptions.IgnoreCase) &&
-    normalized.Length < 90;
-
-static bool LooksLikeEggIncQuestion(string normalized) {
-    string[] terms = [
-        "egg", "eggs", "contract", "coop", "co-op", "prestige", "artifact", "artifacts",
-        "boost", "boosts", "soul", "prophecy", "farmer", "enlightenment", "hab", "shipping",
-        "tachyon", "deflector", "metronome", "gusset", "stones", "eb", "earnings bonus"
-    ];
-    return terms.Any(t => normalized.Contains(t, StringComparison.OrdinalIgnoreCase));
-}
-
-static (string Topic, string Answer)? TryAnswerPlottyQuestion(string normalized) {
-    if(normalized.Contains("who are you") || normalized.Contains("what are you") || normalized.Contains("plotty")) {
-        return ("Plotty", "I am the guild's local Egg Inc assistant: part contract clerk, part pub regular, part spreadsheet with social ambitions.");
-    }
-
-    if(normalized.Contains("register") || normalized.Contains("eid")) {
-        return ("EID registration", "Use `/register-eid` to privately register one or more Egg Inc IDs. I store encrypted EIDs locally and only post a name-only welcome in `plotty-questions`.");
-    }
-
-    if(normalized.Contains("rates")) {
-        return ("rates", "`/rates` privately shows your running contracts and last 2 completed contracts. Staff can use `/admin-rates-all` for the registered-player overview.");
-    }
-
-    if(normalized.Contains("player")) {
-        return ("player profile", "`/player` shows a registered player's recent contribution profile, registration date, and a refresh button.");
-    }
-
-    if(normalized.Contains("egg") && normalized.Contains("laid")) {
-        return ("eggs laid", "`/eggs-laid` privately shows lifetime eggs laid by farm, including virtue eggs in their own section.");
-    }
-
-    if(normalized.Contains("artifact")) {
-        return ("contract artifacts", "`/contract-artifacts` looks at your current contract and artifact inventory, then suggests a contract-focused set with artifact image links.");
-    }
-
-    if(normalized.Contains("demerit")) {
-        return ("demerits", "Members can use `/demerits-view`. Staff can use `/add-demerit`, `/remove-demerit`, and `/admin-demerits-view-all`. Active demerits expire after 30 days.");
-    }
-
-    if(normalized.Contains("beer")) {
-        return ("beer", "`/beer-plotty` buys me a beer, `/beer-user` gifts another member a beer, and `/beerleader` shows the pub legends.");
-    }
-
-    if(normalized.Contains("dashboard")) {
-        return ("admin dashboard", "`/admin-dashboard` gives Staff an overview of registered players, low rates, sync issues, and likely unboosted players.");
-    }
-
-    if(normalized.Contains("help") || normalized.Contains("commands")) {
-        return ("commands", "I know `/register-eid`, `/rates`, `/player`, `/eggs-laid`, `/contract-artifacts`, `/help`, pub commands, and Staff tools. Ask about one and I will unpack it.");
-    }
-
-    return null;
-}
-
-static string InferConversationTopic(string normalized) {
-    if(LooksLikeEggIncQuestion(normalized)) {
-        return "Egg Inc";
-    }
-
-    if(normalized.Contains("beer")) {
-        return "beer";
-    }
-
-    if(normalized.Contains("sync")) {
-        return "sync";
-    }
-
-    if(normalized.Contains("staff")) {
-        return "Staff";
-    }
-
-    return "chat";
-}
-
 static string TrimDiscordMessage(string value, int maxLength) =>
     value.Length <= maxLength ? value : value[..(maxLength - 3)] + "...";
+
+static async Task<IReadOnlyList<TResult>> SelectWithConcurrencyAsync<TSource, TResult>(
+    IEnumerable<TSource> source,
+    int maxConcurrency,
+    Func<TSource, Task<TResult>> selector) {
+    var items = source.ToList();
+    if(items.Count == 0) {
+        return [];
+    }
+
+    using var gate = new SemaphoreSlim(Math.Max(1, maxConcurrency), Math.Max(1, maxConcurrency));
+    var tasks = items.Select(async (item, index) => {
+        await gate.WaitAsync();
+        try {
+            return (Index: index, Result: await selector(item));
+        } finally {
+            gate.Release();
+        }
+    });
+
+    var results = await Task.WhenAll(tasks);
+    return results
+        .OrderBy(r => r.Index)
+        .Select(r => r.Result)
+        .ToList();
+}
 
 static bool LooksLikeQuestion(string content) {
     if(content.Contains('?')) {

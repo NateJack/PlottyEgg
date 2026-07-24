@@ -1,166 +1,160 @@
+using System.Globalization;
 using System.Text.Json;
-using EggContribBot;
+using System.Text.Json.Nodes;
+using EggContribBot.Models;
+using Microsoft.Data.Sqlite;
 
-public sealed class DataStore {
+namespace EggContribBot.Services;
+
+public sealed class DataStore : IDisposable {
+    private const string LegacyImportKey = "legacy_json_imported";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
-    private readonly string _path;
+    private readonly string _databasePath;
+    private readonly string _legacyJsonPath;
+    private readonly string _connectionString;
     private readonly SecureText _secureText;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private bool _initialized;
 
     public DataStore(string path, SecureText secureText) {
-        _path = Path.GetFullPath(path);
+        var configuredPath = Path.GetFullPath(path);
+        _databasePath = Path.GetExtension(configuredPath).Equals(".json", StringComparison.OrdinalIgnoreCase)
+            ? Path.ChangeExtension(configuredPath, ".db")
+            : configuredPath;
+        _legacyJsonPath = Path.GetExtension(configuredPath).Equals(".json", StringComparison.OrdinalIgnoreCase)
+            ? configuredPath
+            : Path.ChangeExtension(configuredPath, ".json");
         _secureText = secureText;
-        Directory.CreateDirectory(Path.GetDirectoryName(_path) ?? ".");
+        Directory.CreateDirectory(Path.GetDirectoryName(_databasePath) ?? ".");
+        _connectionString = new SqliteConnectionStringBuilder {
+            DataSource = _databasePath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Shared,
+            DefaultTimeout = 5
+        }.ToString();
     }
 
-    public async Task LinkAsync(EggUserLink link) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            state.Links.RemoveAll(l =>
-                l.GuildId == link.GuildId &&
-                l.EggId.Equals(link.EggId, StringComparison.OrdinalIgnoreCase));
-            state.Links.Add(link);
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
+    public string DatabasePath => _databasePath;
+
+    public void Dispose() {
+        SqliteConnection.ClearAllPools();
+        _gate.Dispose();
     }
 
-    public async Task<IReadOnlyList<EggUserLink>> GetLinksAsync(ulong guildId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.Links.Where(l => l.GuildId == guildId).ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyDictionary<string, EggUserLink>> GetLinksByEggIdAsync(ulong guildId) {
-        var links = await GetLinksAsync(guildId);
-        return links
-            .GroupBy(l => l.EggId, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
-    }
-
-    public async Task SaveRegisteredEidAsync(ulong guildId, ulong discordUserId, string eid, string? eggName) {
-        var normalized = EggIncClient.NormalizeEggId(eid);
-        var hash = SecureText.Sha256(normalized);
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            state.RegisteredEids.RemoveAll(e => e.GuildId == guildId && e.EidHash.Equals(hash, StringComparison.OrdinalIgnoreCase));
-            state.RegisteredEids.Add(new RegisteredEid(
-                guildId,
-                discordUserId,
-                hash,
-                _secureText.Encrypt(normalized),
-                eggName,
-                DateTimeOffset.UtcNow));
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<string?> GetRegisteredEidAsync(ulong guildId, ulong discordUserId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var record = state.RegisteredEids.LastOrDefault(e => e.GuildId == guildId && e.DiscordUserId == discordUserId);
-            return record is null ? null : _secureText.Decrypt(record.EncryptedEid);
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task SaveRegisteredEidAsync(ulong guildId, ulong discordUserId, string eid, string? eggName) =>
+        WriteAsync(async (connection, transaction) => {
+            var normalized = EggIncClient.NormalizeEggId(eid);
+            var command = CreateCommand(connection, transaction, """
+                INSERT INTO registered_eids
+                    (guild_id, discord_user_id, eid_hash, encrypted_eid, egg_name, updated_at)
+                VALUES ($guild, $user, $hash, $eid, $name, $updated)
+                ON CONFLICT(guild_id, eid_hash) DO UPDATE SET
+                    discord_user_id = excluded.discord_user_id,
+                    encrypted_eid = excluded.encrypted_eid,
+                    egg_name = excluded.egg_name,
+                    updated_at = excluded.updated_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            Add(command, "$hash", SecureText.Sha256(normalized));
+            Add(command, "$eid", _secureText.Encrypt(normalized));
+            Add(command, "$name", eggName);
+            Add(command, "$updated", Date(DateTimeOffset.UtcNow));
+            await ExecuteNonQueryPreparedAsync(command);
+        });
 
     public async Task<RegisteredEggAccount?> GetRegisteredAccountAsync(ulong guildId, ulong discordUserId) {
         var accounts = await GetRegisteredAccountsAsync(guildId, discordUserId);
         return accounts.FirstOrDefault();
     }
 
-    public async Task<IReadOnlyList<RegisteredEggAccount>> GetRegisteredAccountsAsync(ulong guildId, ulong discordUserId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.RegisteredEids
-                .Where(e => e.GuildId == guildId && e.DiscordUserId == discordUserId)
-                .OrderByDescending(e => e.UpdatedAt)
-                .Select(e => new RegisteredEggAccount(e.DiscordUserId, _secureText.Decrypt(e.EncryptedEid), e.EggName, e.UpdatedAt))
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task<IReadOnlyList<RegisteredEggAccount>> GetRegisteredAccountsAsync(ulong guildId, ulong discordUserId) =>
+        ReadAsync<IReadOnlyList<RegisteredEggAccount>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT discord_user_id, encrypted_eid, egg_name, updated_at
+                FROM registered_eids
+                WHERE guild_id = $guild AND discord_user_id = $user
+                ORDER BY updated_at DESC;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            return await ReadAccountsAsync(command);
+        });
 
-    public async Task<IReadOnlyList<RegisteredEggAccount>> GetRegisteredEidsAsync(ulong guildId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.RegisteredEids
-                .Where(e => e.GuildId == guildId)
-                .GroupBy(e => e.EidHash, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.OrderByDescending(e => e.UpdatedAt).First())
-                .Select(e => new RegisteredEggAccount(e.DiscordUserId, _secureText.Decrypt(e.EncryptedEid), e.EggName, e.UpdatedAt))
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task<IReadOnlyList<RegisteredEggAccount>> GetRegisteredEidsAsync(ulong guildId) =>
+        ReadAsync<IReadOnlyList<RegisteredEggAccount>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT discord_user_id, encrypted_eid, egg_name, updated_at
+                FROM registered_eids
+                WHERE guild_id = $guild
+                ORDER BY updated_at DESC;
+                """);
+            Add(command, "$guild", Id(guildId));
+            return await ReadAccountsAsync(command);
+        });
 
-    public async Task<int> AddDemeritsAsync(
+    public Task<int> RemoveRegisteredEidsForUserAsync(ulong guildId, ulong discordUserId) =>
+        WriteAsync(async (connection, transaction) => {
+            var command = CreateCommand(connection, transaction,
+                "DELETE FROM registered_eids WHERE guild_id = $guild AND discord_user_id = $user;");
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            return await ExecuteNonQueryPreparedAsync(command);
+        });
+
+    public Task<int> AddDemeritsAsync(
         ulong guildId,
         ulong discordUserId,
         int amount,
         string reason,
         string? contractId,
         string? sourceKey,
-        string? playerName = null) {
-        amount = Math.Max(1, amount);
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+        string? playerName = null) =>
+        WriteAsync(async (connection, transaction) => {
+            var count = Math.Max(1, amount);
             var now = DateTimeOffset.UtcNow;
-            for(var i = 0; i < amount; i++) {
-                state.Demerits.Add(new DemeritEntry(
-                    Guid.NewGuid().ToString("N"),
-                    guildId,
-                    discordUserId,
-                    1,
-                    reason,
-                    contractId,
-                    playerName,
-                    sourceKey,
-                    now,
-                    now.AddDays(30),
-                    RemovedAt: null));
+            for(var i = 0; i < count; i++) {
+                await InsertDemeritAsync(
+                    connection,
+                    transaction,
+                    new DemeritEntry(
+                        Guid.NewGuid().ToString("N"),
+                        guildId,
+                        discordUserId,
+                        1,
+                        reason,
+                        contractId,
+                        playerName,
+                        sourceKey,
+                        now,
+                        now.AddDays(30),
+                        null));
             }
+            return count;
+        });
 
-            await SaveAsync(state);
-            return amount;
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<DemeritEntry>> AddAutoDemeritsAsync(
+    public Task<IReadOnlyList<DemeritEntry>> AddAutoDemeritsAsync(
         ulong guildId,
-        IReadOnlyList<AutoDemeritCandidate> candidates) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+        IReadOnlyList<AutoDemeritCandidate> candidates) =>
+        WriteAsync<IReadOnlyList<DemeritEntry>>(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
-            var activeSourceKeys = state.Demerits
-                .Where(d => d.GuildId == guildId && d.RemovedAt is null && d.ExpiresAt > now && !string.IsNullOrWhiteSpace(d.SourceKey))
-                .Select(d => d.SourceKey!)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
             var added = new List<DemeritEntry>();
             foreach(var candidate in candidates
-                .GroupBy(c => c.SourceKey, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.First())) {
-                if(activeSourceKeys.Contains(candidate.SourceKey)) {
+                .GroupBy(item => item.SourceKey, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())) {
+                var exists = CreateCommand(connection, transaction, """
+                    SELECT 1
+                    FROM demerits
+                    WHERE guild_id = $guild
+                      AND source_key = $source
+                      AND removed_at IS NULL
+                      AND expires_at > $now
+                    LIMIT 1;
+                    """);
+                Add(exists, "$guild", Id(guildId));
+                Add(exists, "$source", candidate.SourceKey);
+                Add(exists, "$now", Date(now));
+                if(await ExecuteScalarPreparedAsync(exists) is not null) {
                     continue;
                 }
 
@@ -175,110 +169,117 @@ public sealed class DataStore {
                     candidate.SourceKey,
                     now,
                     now.AddDays(30),
-                    RemovedAt: null);
-                state.Demerits.Add(entry);
+                    null);
+                await InsertDemeritAsync(connection, transaction, entry);
                 added.Add(entry);
-                activeSourceKeys.Add(candidate.SourceKey);
             }
-
-            if(added.Count > 0) {
-                await SaveAsync(state);
-            }
-
             return added;
-        } finally {
-            _gate.Release();
-        }
-    }
+        });
 
-    public async Task<int> RemoveDemeritsAsync(ulong guildId, ulong discordUserId, int amount) {
-        amount = Math.Max(1, amount);
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+    public Task<int> RemoveDemeritsAsync(ulong guildId, ulong discordUserId, int amount) =>
+        WriteAsync(async (connection, transaction) => {
+            var command = CreateCommand(connection, transaction, """
+                UPDATE demerits
+                SET removed_at = $now
+                WHERE id IN (
+                    SELECT id
+                    FROM demerits
+                    WHERE guild_id = $guild
+                      AND discord_user_id = $user
+                      AND removed_at IS NULL
+                      AND expires_at > $now
+                    ORDER BY created_at DESC
+                    LIMIT $amount
+                );
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            Add(command, "$now", Date(DateTimeOffset.UtcNow));
+            Add(command, "$amount", Math.Max(1, amount));
+            return await ExecuteNonQueryPreparedAsync(command);
+        });
+
+    public Task<IReadOnlyList<DemeritEntry>> GetActiveDemeritsAsync(ulong guildId, ulong? discordUserId = null) =>
+        ReadAsync<IReadOnlyList<DemeritEntry>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT id, guild_id, discord_user_id, amount, reason, contract_id, player_name,
+                       source_key, created_at, expires_at, removed_at
+                FROM demerits
+                WHERE guild_id = $guild
+                  AND removed_at IS NULL
+                  AND expires_at > $now
+                  AND ($user IS NULL OR discord_user_id = $user)
+                ORDER BY expires_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", discordUserId is null ? null : Id(discordUserId.Value));
+            Add(command, "$now", Date(DateTimeOffset.UtcNow));
+            var result = new List<DemeritEntry>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                result.Add(ReadDemerit(reader));
+            }
+            return result;
+        });
+
+    public Task<bool> HasMissingJoinAlertAsync(string key) =>
+        ExistsAsync("SELECT 1 FROM missing_join_alerts WHERE key = $key COLLATE NOCASE LIMIT 1;", ("$key", key));
+
+    public Task RecordMissingJoinAlertAsync(string key) =>
+        WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
-            var active = state.Demerits
-                .Where(d => d.GuildId == guildId && d.DiscordUserId == discordUserId && d.RemovedAt is null && d.ExpiresAt > now)
-                .OrderByDescending(d => d.CreatedAt)
-                .Take(amount)
-                .ToList();
+            var cleanup = CreateCommand(connection, transaction, "DELETE FROM missing_join_alerts WHERE posted_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(now.AddDays(-90)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
-            foreach(var entry in active) {
-                var index = state.Demerits.FindIndex(d => d.Id == entry.Id);
-                if(index >= 0) {
-                    state.Demerits[index] = entry with { RemovedAt = now };
-                }
-            }
+            var command = CreateCommand(connection, transaction, """
+                INSERT INTO missing_join_alerts (key, posted_at)
+                VALUES ($key, $posted)
+                ON CONFLICT(key) DO NOTHING;
+                """);
+            Add(command, "$key", key);
+            Add(command, "$posted", Date(now));
+            await ExecuteNonQueryPreparedAsync(command);
+        });
 
-            if(active.Count > 0) {
-                await SaveAsync(state);
-            }
+    public Task<bool> HasFirstCoopAwardAsync(string key) =>
+        ExistsAsync("SELECT 1 FROM first_coop_awards WHERE key = $key COLLATE NOCASE LIMIT 1;", ("$key", key));
 
-            return active.Count;
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task RecordFirstCoopAwardAsync(FirstCoopAward award) =>
+        WriteAsync(async (connection, transaction) => {
+            var cleanup = CreateCommand(connection, transaction, "DELETE FROM first_coop_awards WHERE awarded_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(DateTimeOffset.UtcNow.AddDays(-180)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
-    public async Task<IReadOnlyList<DemeritEntry>> GetActiveDemeritsAsync(ulong guildId, ulong? discordUserId = null) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            return state.Demerits
-                .Where(d => d.GuildId == guildId && d.RemovedAt is null && d.ExpiresAt > now)
-                .Where(d => discordUserId is null || d.DiscordUserId == discordUserId.Value)
-                .OrderBy(d => d.ExpiresAt)
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
+            await InsertFirstCoopAwardAsync(connection, transaction, award);
+        });
 
-    public async Task<bool> HasMissingJoinAlertAsync(string key) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.MissingJoinAlerts.Any(a => a.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task<bool> HasWeeklyTokenLeaderboardPostAsync(ulong guildId, string weekKey) =>
+        ExistsAsync("""
+            SELECT 1 FROM weekly_token_leaderboard_posts
+            WHERE guild_id = $guild AND week_key = $week COLLATE NOCASE LIMIT 1;
+            """, ("$guild", Id(guildId)), ("$week", weekKey));
 
-    public async Task RecordMissingJoinAlertAsync(string key) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            if(state.MissingJoinAlerts.Any(a => a.Key.Equals(key, StringComparison.OrdinalIgnoreCase))) {
-                return;
-            }
+    public Task RecordWeeklyTokenLeaderboardPostAsync(WeeklyTokenLeaderboardPost post) =>
+        WriteAsync(async (connection, transaction) => {
+            var cleanup = CreateCommand(connection, transaction,
+                "DELETE FROM weekly_token_leaderboard_posts WHERE posted_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(DateTimeOffset.UtcNow.AddDays(-180)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
-            var cutoff = DateTimeOffset.UtcNow.AddDays(-90);
-            state.MissingJoinAlerts.RemoveAll(a => a.PostedAt < cutoff);
-            state.MissingJoinAlerts.Add(new MissingJoinAlert(key, DateTimeOffset.UtcNow));
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
+            await InsertWeeklyTokenPostAsync(connection, transaction, post);
+        });
 
-    public async Task<ContractLateNotice> RecordContractLateNoticeAsync(
+    public Task<ContractLateNotice> RecordContractLateNoticeAsync(
         ulong guildId,
         ulong discordUserId,
         string? contractId,
         string? eta,
-        string? note) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+        string? note,
+        DateTimeOffset? expiresAt = null) =>
+        WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
             var normalizedContractId = string.IsNullOrWhiteSpace(contractId) ? null : contractId.Trim();
-            state.ContractLateNotices.RemoveAll(n =>
-                n.GuildId == guildId &&
-                n.DiscordUserId == discordUserId &&
-                string.Equals(n.ContractId ?? "", normalizedContractId ?? "", StringComparison.OrdinalIgnoreCase));
-            state.ContractLateNotices.RemoveAll(n => n.ExpiresAt <= now);
-
             var notice = new ContractLateNotice(
                 guildId,
                 discordUserId,
@@ -286,157 +287,161 @@ public sealed class DataStore {
                 eta,
                 note,
                 now,
-                now.AddHours(48));
-            state.ContractLateNotices.Add(notice);
-            await SaveAsync(state);
+                expiresAt is null || expiresAt <= now ? now.AddHours(48) : expiresAt.Value);
+
+            var cleanup = CreateCommand(connection, transaction, "DELETE FROM contract_late_notices WHERE expires_at <= $now;");
+            Add(cleanup, "$now", Date(now));
+            await ExecuteNonQueryPreparedAsync(cleanup);
+            await InsertLateNoticeAsync(connection, transaction, notice);
             return notice;
-        } finally {
-            _gate.Release();
-        }
-    }
+        });
 
-    public async Task<IReadOnlySet<ulong>> GetActiveContractLateNoticeUserIdsAsync(ulong guildId, string contractId) {
-        await _gate.WaitAsync();
-        try {
+    public Task<IReadOnlySet<ulong>> GetActiveContractLateNoticeUserIdsAsync(ulong guildId, string contractId) =>
+        ReadAsync<IReadOnlySet<ulong>>(async connection => {
             var now = DateTimeOffset.UtcNow;
-            var state = await LoadAsync();
-            state.ContractLateNotices.RemoveAll(n => n.ExpiresAt <= now);
-            return state.ContractLateNotices
-                .Where(n => n.GuildId == guildId && n.ExpiresAt > now)
-                .Where(n => string.IsNullOrWhiteSpace(n.ContractId) || string.Equals(n.ContractId, contractId, StringComparison.OrdinalIgnoreCase))
-                .Select(n => n.DiscordUserId)
-                .ToHashSet();
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<int> RemoveContractLateNoticesAsync(ulong guildId, ulong discordUserId, string? contractId) {
-        await _gate.WaitAsync();
-        try {
-            var now = DateTimeOffset.UtcNow;
-            var state = await LoadAsync();
-            var removed = state.ContractLateNotices.RemoveAll(n =>
-                n.GuildId == guildId &&
-                n.DiscordUserId == discordUserId &&
-                n.ExpiresAt > now &&
-                (string.IsNullOrWhiteSpace(contractId) || string.Equals(n.ContractId, contractId, StringComparison.OrdinalIgnoreCase)));
-            state.ContractLateNotices.RemoveAll(n => n.ExpiresAt <= now);
-
-            if(removed > 0) {
-                await SaveAsync(state);
+            var command = CreateCommand(connection, null, """
+                SELECT DISTINCT discord_user_id
+                FROM contract_late_notices
+                WHERE guild_id = $guild
+                  AND expires_at > $now
+                  AND (contract_id IS NULL OR contract_id = '' OR contract_id = $contract COLLATE NOCASE);
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$now", Date(now));
+            Add(command, "$contract", contractId);
+            var result = new HashSet<ulong>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                result.Add(ParseId(reader.GetString(0)));
             }
+            return result;
+        });
 
+    public Task<int> RemoveContractLateNoticesAsync(ulong guildId, ulong discordUserId, string? contractId) =>
+        WriteAsync(async (connection, transaction) => {
+            var now = DateTimeOffset.UtcNow;
+            var command = CreateCommand(connection, transaction, """
+                DELETE FROM contract_late_notices
+                WHERE guild_id = $guild
+                  AND discord_user_id = $user
+                  AND expires_at > $now
+                  AND ($contract IS NULL OR contract_id = $contract COLLATE NOCASE);
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            Add(command, "$now", Date(now));
+            Add(command, "$contract", string.IsNullOrWhiteSpace(contractId) ? null : contractId.Trim());
+            var removed = await ExecuteNonQueryPreparedAsync(command);
+
+            var cleanup = CreateCommand(connection, transaction, "DELETE FROM contract_late_notices WHERE expires_at <= $now;");
+            Add(cleanup, "$now", Date(now));
+            await ExecuteNonQueryPreparedAsync(cleanup);
             return removed;
-        } finally {
-            _gate.Release();
-        }
-    }
+        });
 
-    public async Task UpsertShipReturnNotificationAsync(ShipReturnNotification notification) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+    public Task UpsertShipReturnNotificationAsync(ShipReturnNotification notification) =>
+        WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
-            state.ShipReturnNotifications.RemoveAll(n =>
-                n.Key.Equals(notification.Key, StringComparison.OrdinalIgnoreCase) ||
-                (n.NotifiedAt is not null && n.NotifiedAt < now.AddDays(-7)) ||
-                (n.NotifiedAt is null && n.ReturnAt < now.AddDays(-2)));
-            state.ShipReturnNotifications.Add(notification);
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
+            var cleanup = CreateCommand(connection, transaction, """
+                DELETE FROM ship_return_notifications
+                WHERE (notified_at IS NOT NULL AND notified_at < $notifiedCutoff)
+                   OR (notified_at IS NULL AND return_at < $pendingCutoff);
+                """);
+            Add(cleanup, "$notifiedCutoff", Date(now.AddDays(-7)));
+            Add(cleanup, "$pendingCutoff", Date(now.AddDays(-2)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
+            await InsertShipNotificationAsync(connection, transaction, notification);
+        });
 
-    public async Task<IReadOnlyList<ShipReturnNotification>> GetDueShipReturnNotificationsAsync(ulong guildId, DateTimeOffset now) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.ShipReturnNotifications
-                .Where(n => n.GuildId == guildId && n.NotifiedAt is null && n.ReturnAt <= now)
-                .OrderBy(n => n.ReturnAt)
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task<IReadOnlyList<ShipReturnNotification>> GetDueShipReturnNotificationsAsync(ulong guildId, DateTimeOffset now) =>
+        ReadAsync<IReadOnlyList<ShipReturnNotification>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT guild_id, discord_user_id, eid_hash, mission_key, ship_name,
+                       return_at, created_at, notified_at
+                FROM ship_return_notifications
+                WHERE guild_id = $guild AND notified_at IS NULL AND return_at <= $now
+                ORDER BY return_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$now", Date(now));
+            var result = new List<ShipReturnNotification>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                result.Add(new ShipReturnNotification(
+                    ParseId(reader.GetString(0)),
+                    ParseId(reader.GetString(1)),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.GetString(4),
+                    ParseDate(reader.GetString(5)),
+                    ParseDate(reader.GetString(6)),
+                    NullableDate(reader, 7)));
+            }
+            return result;
+        });
 
-    public async Task MarkShipReturnNotificationSentAsync(string key, DateTimeOffset sentAt) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var index = state.ShipReturnNotifications.FindIndex(n => n.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
-            if(index < 0) {
-                return;
+    public Task MarkShipReturnNotificationSentAsync(string key, DateTimeOffset sentAt) =>
+        WriteAsync(async (connection, transaction) => {
+            var command = CreateCommand(connection, transaction,
+                "UPDATE ship_return_notifications SET notified_at = $sent WHERE key = $key COLLATE NOCASE;");
+            Add(command, "$sent", Date(sentAt));
+            Add(command, "$key", key);
+            await ExecuteNonQueryPreparedAsync(command);
+        });
+
+    public Task<BeerAttemptResult> TryAddPlottyBeerAsync(
+        ulong guildId,
+        ulong discordUserId,
+        bool botBuysBack,
+        bool bypassCooldown = false) =>
+        WriteAsync(async (connection, transaction) => {
+            var now = DateTimeOffset.UtcNow;
+            var current = await GetBeerStatsAsync(connection, transaction, guildId, discordUserId);
+            var nextBeerAt = current?.LastBeerAt.AddHours(1);
+            if(!bypassCooldown && nextBeerAt > now) {
+                return new BeerAttemptResult(false, current!, nextBeerAt.Value - now);
             }
 
-            state.ShipReturnNotifications[index] = state.ShipReturnNotifications[index] with { NotifiedAt = sentAt };
-            await SaveAsync(state);
-        } finally {
-            _gate.Release();
-        }
-    }
-
-    public async Task<BeerAttemptResult> TryAddPlottyBeerAsync(ulong guildId, ulong discordUserId, bool botBuysBack, bool bypassCooldown = false) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var now = DateTimeOffset.UtcNow;
-            var index = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == discordUserId);
-            var current = index >= 0
-                ? state.BeerStats[index]
-                : new BeerStats(guildId, discordUserId, 0, 0, now, now, null);
-            var nextBeerAt = current.LastBeerAt.AddHours(1);
-            if(!bypassCooldown && index >= 0 && nextBeerAt > now) {
-                return new BeerAttemptResult(false, current, nextBeerAt - now);
-            }
-
+            current ??= new BeerStats(guildId, discordUserId, 0, 0, now, now, null);
             var updated = current with {
                 BeersGivenToBot = current.BeersGivenToBot + 1,
                 BeersBoughtByBot = current.BeersBoughtByBot + (botBuysBack ? 1 : 0),
                 LastBeerAt = now,
                 LastBotBeerAt = botBuysBack ? now : current.LastBotBeerAt
             };
-
-            if(index >= 0) {
-                state.BeerStats[index] = updated;
-            } else {
-                state.BeerStats.Add(updated);
-            }
-
-            await SaveAsync(state);
+            await UpsertBeerStatsAsync(connection, transaction, updated);
             return new BeerAttemptResult(true, updated, null);
-        } finally {
-            _gate.Release();
-        }
-    }
+        });
 
-    public async Task<BeerAttemptResult> TryGiftBeerAsync(ulong guildId, ulong giverDiscordUserId, ulong recipientDiscordUserId, bool bypassCooldown = false) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+    public Task<BeerAttemptResult> TryGiftBeerAsync(
+        ulong guildId,
+        ulong giverDiscordUserId,
+        ulong recipientDiscordUserId,
+        bool bypassCooldown = false) =>
+        WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
-            var lastGift = state.BeerGiftLogs
-                .Where(g => g.GuildId == guildId && g.GiverDiscordUserId == giverDiscordUserId && g.RecipientDiscordUserId == recipientDiscordUserId)
-                .OrderByDescending(g => g.GiftedAt)
-                .FirstOrDefault();
-            var nextGiftAt = lastGift?.GiftedAt.AddDays(1);
+            var giftCommand = CreateCommand(connection, transaction, """
+                SELECT gifted_at
+                FROM beer_gift_logs
+                WHERE guild_id = $guild AND giver_discord_user_id = $giver AND recipient_discord_user_id = $recipient
+                ORDER BY gifted_at DESC LIMIT 1;
+                """);
+            Add(giftCommand, "$guild", Id(guildId));
+            Add(giftCommand, "$giver", Id(giverDiscordUserId));
+            Add(giftCommand, "$recipient", Id(recipientDiscordUserId));
+            var lastGiftValue = await ExecuteScalarPreparedAsync(giftCommand);
+            var nextGiftAt = lastGiftValue is string value ? ParseDate(value).AddHours(1) : (DateTimeOffset?)null;
 
-            var recipientIndex = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == recipientDiscordUserId);
-            var recipient = recipientIndex >= 0
-                ? state.BeerStats[recipientIndex]
-                : new BeerStats(guildId, recipientDiscordUserId, 0, 0, now, now, null);
-
-            if(!bypassCooldown && nextGiftAt is not null && nextGiftAt > now) {
+            var recipient = await GetBeerStatsAsync(connection, transaction, guildId, recipientDiscordUserId)
+                ?? new BeerStats(guildId, recipientDiscordUserId, 0, 0, now, now, null);
+            if(!bypassCooldown && nextGiftAt > now) {
                 return new BeerAttemptResult(false, recipient, nextGiftAt.Value - now);
             }
 
-            var giverIndex = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == giverDiscordUserId);
-            var giver = giverIndex >= 0
-                ? state.BeerStats[giverIndex]
-                : new BeerStats(guildId, giverDiscordUserId, 0, 0, now, now, null);
-
+            var giver = giverDiscordUserId == recipientDiscordUserId
+                ? recipient
+                : await GetBeerStatsAsync(connection, transaction, guildId, giverDiscordUserId)
+                    ?? new BeerStats(guildId, giverDiscordUserId, 0, 0, now, now, null);
             var updatedRecipient = recipient with {
                 BeersReceivedFromMembers = recipient.BeersReceivedFromMembers + 1,
                 LastMemberBeerReceivedAt = now
@@ -446,57 +451,57 @@ public sealed class DataStore {
                 LastMemberBeerGivenAt = now
             };
 
-            if(recipientIndex >= 0) {
-                state.BeerStats[recipientIndex] = updatedRecipient;
-            } else {
-                state.BeerStats.Add(updatedRecipient);
-            }
-
             if(giverDiscordUserId == recipientDiscordUserId) {
-                var selfIndex = state.BeerStats.FindIndex(b => b.GuildId == guildId && b.DiscordUserId == giverDiscordUserId);
-                state.BeerStats[selfIndex] = updatedRecipient with {
+                updatedRecipient = updatedRecipient with {
                     BeersGivenToMembers = updatedRecipient.BeersGivenToMembers + 1,
                     LastMemberBeerGivenAt = now
                 };
-            } else if(giverIndex >= 0) {
-                state.BeerStats[giverIndex] = updatedGiver;
             } else {
-                state.BeerStats.Add(updatedGiver);
+                await UpsertBeerStatsAsync(connection, transaction, updatedGiver);
             }
+            await UpsertBeerStatsAsync(connection, transaction, updatedRecipient);
 
-            state.BeerGiftLogs.Add(new BeerGiftLog(guildId, giverDiscordUserId, recipientDiscordUserId, now));
-            await SaveAsync(state);
+            var log = CreateCommand(connection, transaction, """
+                INSERT INTO beer_gift_logs
+                    (guild_id, giver_discord_user_id, recipient_discord_user_id, gifted_at)
+                VALUES ($guild, $giver, $recipient, $gifted);
+                """);
+            Add(log, "$guild", Id(guildId));
+            Add(log, "$giver", Id(giverDiscordUserId));
+            Add(log, "$recipient", Id(recipientDiscordUserId));
+            Add(log, "$gifted", Date(now));
+            await ExecuteNonQueryPreparedAsync(log);
             return new BeerAttemptResult(true, updatedRecipient, null);
-        } finally {
-            _gate.Release();
-        }
-    }
+        });
 
-    public async Task<IReadOnlyList<BeerStats>> GetBeerLeaderboardAsync(ulong guildId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            return state.BeerStats
-                .Where(b => b.GuildId == guildId)
-                .OrderByDescending(b => b.BeersBoughtByBot)
-                .ThenByDescending(b => b.BeersGivenToBot)
-                .ThenBy(b => b.FirstBeerAt)
-                .ToList();
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task<IReadOnlyList<BeerStats>> GetBeerLeaderboardAsync(ulong guildId) =>
+        ReadAsync<IReadOnlyList<BeerStats>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT guild_id, discord_user_id, beers_given_to_bot, beers_bought_by_bot,
+                       first_beer_at, last_beer_at, last_bot_beer_at,
+                       beers_received_from_members, beers_given_to_members,
+                       last_member_beer_received_at, last_member_beer_given_at
+                FROM beer_stats
+                WHERE guild_id = $guild
+                ORDER BY beers_bought_by_bot DESC, beers_given_to_bot DESC, first_beer_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            var result = new List<BeerStats>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                result.Add(ReadBeerStats(reader));
+            }
+            return result;
+        });
 
-    public async Task<PlottyMemory> RecordPlottyInteractionAsync(ulong guildId, ulong discordUserId, string interactionType) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+    public Task<PlottyMemory> RecordPlottyInteractionAsync(
+        ulong guildId,
+        ulong discordUserId,
+        string interactionType) =>
+        WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
-            var index = state.PlottyMemories.FindIndex(m => m.GuildId == guildId && m.DiscordUserId == discordUserId);
-            var current = index >= 0
-                ? state.PlottyMemories[index]
-                : new PlottyMemory(guildId, discordUserId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, now, now);
-
+            var current = await GetPlottyMemoryAsync(connection, transaction, guildId, discordUserId)
+                ?? new PlottyMemory(guildId, discordUserId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, now, now);
             var updated = interactionType switch {
                 "mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, LastSeenAt = now },
                 "question_mention" => current with { TotalInteractions = current.TotalInteractions + 1, Mentions = current.Mentions + 1, QuestionsDodged = current.QuestionsDodged + 1, LastSeenAt = now },
@@ -509,92 +514,620 @@ public sealed class DataStore {
                 "wisdom" => current with { TotalInteractions = current.TotalInteractions + 1, WisdomRequests = current.WisdomRequests + 1, LastSeenAt = now },
                 _ => current with { TotalInteractions = current.TotalInteractions + 1, LastSeenAt = now }
             };
-
-            if(index >= 0) {
-                state.PlottyMemories[index] = updated;
-            } else {
-                state.PlottyMemories.Add(updated);
-            }
-
-            await SaveAsync(state);
+            await UpsertPlottyMemoryAsync(connection, transaction, updated);
             return updated;
-        } finally {
-            _gate.Release();
-        }
-    }
+        });
 
-    public async Task<PlottyConversationState?> GetPlottyConversationAsync(ulong guildId, ulong discordUserId) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
-            var cutoff = DateTimeOffset.UtcNow.AddHours(-6);
-            return state.PlottyConversations
-                .Where(c => c.GuildId == guildId && c.DiscordUserId == discordUserId && c.LastSeenAt >= cutoff)
-                .OrderByDescending(c => c.LastSeenAt)
-                .FirstOrDefault();
-        } finally {
-            _gate.Release();
-        }
-    }
+    public Task<PlottyConversationState?> GetPlottyConversationAsync(ulong guildId, ulong discordUserId) =>
+        ReadAsync<PlottyConversationState?>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT guild_id, discord_user_id, last_topic, turns, first_seen_at, last_seen_at
+                FROM plotty_conversations
+                WHERE guild_id = $guild AND discord_user_id = $user AND last_seen_at >= $cutoff
+                LIMIT 1;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            Add(command, "$cutoff", Date(DateTimeOffset.UtcNow.AddHours(-6)));
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            return await reader.ReadAsync() ? ReadConversation(reader) : null;
+        });
 
-    public async Task<PlottyConversationState> RecordPlottyConversationAsync(ulong guildId, ulong discordUserId, string topic) {
-        await _gate.WaitAsync();
-        try {
-            var state = await LoadAsync();
+    public Task<PlottyConversationState> RecordPlottyConversationAsync(
+        ulong guildId,
+        ulong discordUserId,
+        string topic) =>
+        WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
-            var cutoff = now.AddDays(-14);
-            state.PlottyConversations.RemoveAll(c => c.LastSeenAt < cutoff);
+            var cleanup = CreateCommand(connection, transaction, "DELETE FROM plotty_conversations WHERE last_seen_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(now.AddDays(-14)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
 
             var cleanTopic = string.IsNullOrWhiteSpace(topic) ? "chat" : topic.Trim();
             if(cleanTopic.Length > 80) {
                 cleanTopic = cleanTopic[..80];
             }
 
-            var index = state.PlottyConversations.FindIndex(c => c.GuildId == guildId && c.DiscordUserId == discordUserId);
-            var current = index >= 0
-                ? state.PlottyConversations[index]
-                : new PlottyConversationState(guildId, discordUserId, cleanTopic, 0, now, now);
-            var updated = current with {
-                LastTopic = cleanTopic,
-                Turns = current.Turns + 1,
-                LastSeenAt = now
-            };
+            var existing = CreateCommand(connection, transaction, """
+                SELECT guild_id, discord_user_id, last_topic, turns, first_seen_at, last_seen_at
+                FROM plotty_conversations
+                WHERE guild_id = $guild AND discord_user_id = $user LIMIT 1;
+                """);
+            Add(existing, "$guild", Id(guildId));
+            Add(existing, "$user", Id(discordUserId));
+            PlottyConversationState? current;
+            await using(var reader = await ExecuteReaderPreparedAsync(existing)) {
+                current = await reader.ReadAsync() ? ReadConversation(reader) : null;
+            }
+            current ??= new PlottyConversationState(guildId, discordUserId, cleanTopic, 0, now, now);
+            var updated = current with { LastTopic = cleanTopic, Turns = current.Turns + 1, LastSeenAt = now };
+            await UpsertConversationAsync(connection, transaction, updated);
+            return updated;
+        });
 
-            if(index >= 0) {
-                state.PlottyConversations[index] = updated;
-            } else {
-                state.PlottyConversations.Add(updated);
+    public async Task RemoveLegacyPlaintextLinksAsync() {
+        await _gate.WaitAsync();
+        try {
+            await EnsureInitializedAsync();
+            if(!File.Exists(_legacyJsonPath)) {
+                return;
             }
 
-            await SaveAsync(state);
-            return updated;
+            var json = await File.ReadAllTextAsync(_legacyJsonPath);
+            var root = JsonNode.Parse(json)?.AsObject();
+            var linksProperty = root?
+                .Select(pair => pair.Key)
+                .FirstOrDefault(key => key.Equals("links", StringComparison.OrdinalIgnoreCase));
+            if(root is null || linksProperty is null) {
+                return;
+            }
+
+            root.Remove(linksProperty);
+            await WriteAtomicTextAsync(_legacyJsonPath, root.ToJsonString(JsonOptions));
         } finally {
             _gate.Release();
         }
     }
 
-    private async Task<State> LoadAsync() {
-        if(!File.Exists(_path)) {
-            return new State();
-        }
+    private Task<bool> ExistsAsync(string sql, params (string Name, object? Value)[] parameters) =>
+        ReadAsync(async connection => {
+            var command = CreateCommand(connection, null, sql);
+            foreach(var parameter in parameters) {
+                Add(command, parameter.Name, parameter.Value);
+            }
+            return await ExecuteScalarPreparedAsync(command) is not null;
+        });
 
-        await using var stream = File.OpenRead(_path);
-        return await JsonSerializer.DeserializeAsync<State>(stream, JsonOptions) ?? new State();
+    private async Task<IReadOnlyList<RegisteredEggAccount>> ReadAccountsAsync(SqliteCommand command) {
+        var result = new List<RegisteredEggAccount>();
+        await using var reader = await ExecuteReaderPreparedAsync(command);
+        while(await reader.ReadAsync()) {
+            result.Add(new RegisteredEggAccount(
+                ParseId(reader.GetString(0)),
+                _secureText.Decrypt(reader.GetString(1)),
+                NullableString(reader, 2),
+                ParseDate(reader.GetString(3))));
+        }
+        return result;
     }
 
-    private async Task SaveAsync(State state) {
-        var tmp = _path + ".tmp";
-        await using(var stream = File.Create(tmp)) {
-            await JsonSerializer.SerializeAsync(stream, state, JsonOptions);
+    private async Task<T> ReadAsync<T>(Func<SqliteConnection, Task<T>> action) {
+        await _gate.WaitAsync();
+        try {
+            await EnsureInitializedAsync();
+            await using var connection = await OpenConnectionAsync();
+            return await action(connection);
+        } finally {
+            _gate.Release();
         }
-        File.Move(tmp, _path, overwrite: true);
     }
 
-    private sealed class State {
-        public List<EggUserLink> Links { get; set; } = [];
+    private async Task WriteAsync(Func<SqliteConnection, SqliteTransaction, Task> action) {
+        await WriteAsync(async (connection, transaction) => {
+            await action(connection, transaction);
+            return true;
+        });
+    }
+
+    private async Task<T> WriteAsync<T>(Func<SqliteConnection, SqliteTransaction, Task<T>> action) {
+        await _gate.WaitAsync();
+        try {
+            await EnsureInitializedAsync();
+            await using var connection = await OpenConnectionAsync();
+            await using var transaction = await connection.BeginTransactionAsync();
+            var result = await action(connection, (SqliteTransaction)transaction);
+            await transaction.CommitAsync();
+            return result;
+        } finally {
+            _gate.Release();
+        }
+    }
+
+    private async Task EnsureInitializedAsync() {
+        if(_initialized) {
+            return;
+        }
+
+        await using var connection = await OpenConnectionAsync();
+        await ExecutePreparedStatementsAsync(connection, null, SchemaSql);
+
+        var imported = CreateCommand(connection, null, "SELECT value FROM metadata WHERE key = $key;");
+        Add(imported, "$key", LegacyImportKey);
+        if(await ExecuteScalarPreparedAsync(imported) is null) {
+            await ImportLegacyJsonAsync(connection);
+        }
+        _initialized = true;
+    }
+
+    private async Task ImportLegacyJsonAsync(SqliteConnection connection) {
+        LegacyState state = new();
+        if(File.Exists(_legacyJsonPath)) {
+            await using var stream = File.OpenRead(_legacyJsonPath);
+            state = await JsonSerializer.DeserializeAsync<LegacyState>(stream, JsonOptions) ?? new LegacyState();
+        }
+
+        await using var transactionBase = await connection.BeginTransactionAsync();
+        var transaction = (SqliteTransaction)transactionBase;
+        foreach(var entry in state.RegisteredEids) {
+            await InsertRegisteredEidAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.Demerits) {
+            await InsertDemeritAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.MissingJoinAlerts) {
+            var command = CreateCommand(connection, transaction, """
+                INSERT INTO missing_join_alerts (key, posted_at) VALUES ($key, $posted)
+                ON CONFLICT(key) DO NOTHING;
+                """);
+            Add(command, "$key", entry.Key);
+            Add(command, "$posted", Date(entry.PostedAt));
+            await ExecuteNonQueryPreparedAsync(command);
+        }
+        foreach(var entry in state.FirstCoopAwards) {
+            await InsertFirstCoopAwardAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.WeeklyTokenLeaderboardPosts) {
+            await InsertWeeklyTokenPostAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.ContractLateNotices) {
+            await InsertLateNoticeAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.ShipReturnNotifications) {
+            await InsertShipNotificationAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.BeerStats) {
+            await UpsertBeerStatsAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.BeerGiftLogs) {
+            var command = CreateCommand(connection, transaction, """
+                INSERT INTO beer_gift_logs
+                    (guild_id, giver_discord_user_id, recipient_discord_user_id, gifted_at)
+                VALUES ($guild, $giver, $recipient, $gifted);
+                """);
+            Add(command, "$guild", Id(entry.GuildId));
+            Add(command, "$giver", Id(entry.GiverDiscordUserId));
+            Add(command, "$recipient", Id(entry.RecipientDiscordUserId));
+            Add(command, "$gifted", Date(entry.GiftedAt));
+            await ExecuteNonQueryPreparedAsync(command);
+        }
+        foreach(var entry in state.PlottyMemories) {
+            await UpsertPlottyMemoryAsync(connection, transaction, entry);
+        }
+        foreach(var entry in state.PlottyConversations) {
+            await UpsertConversationAsync(connection, transaction, entry);
+        }
+
+        var marker = CreateCommand(connection, transaction, """
+            INSERT INTO metadata (key, value) VALUES ($key, $value)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """);
+        Add(marker, "$key", LegacyImportKey);
+        Add(marker, "$value", Date(DateTimeOffset.UtcNow));
+        await ExecuteNonQueryPreparedAsync(marker);
+        await transaction.CommitAsync();
+    }
+
+    private async Task<SqliteConnection> OpenConnectionAsync() {
+        var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync();
+        await ExecutePreparedStatementsAsync(
+            connection,
+            null,
+            "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+        return connection;
+    }
+
+    private static async Task InsertRegisteredEidAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        RegisteredEid entry) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO registered_eids
+                (guild_id, discord_user_id, eid_hash, encrypted_eid, egg_name, updated_at)
+            VALUES ($guild, $user, $hash, $eid, $name, $updated)
+            ON CONFLICT(guild_id, eid_hash) DO UPDATE SET
+                discord_user_id = excluded.discord_user_id,
+                encrypted_eid = excluded.encrypted_eid,
+                egg_name = excluded.egg_name,
+                updated_at = excluded.updated_at;
+            """);
+        Add(command, "$guild", Id(entry.GuildId));
+        Add(command, "$user", Id(entry.DiscordUserId));
+        Add(command, "$hash", entry.EidHash);
+        Add(command, "$eid", entry.EncryptedEid);
+        Add(command, "$name", entry.EggName);
+        Add(command, "$updated", Date(entry.UpdatedAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task InsertDemeritAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        DemeritEntry entry) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO demerits
+                (id, guild_id, discord_user_id, amount, reason, contract_id, player_name,
+                 source_key, created_at, expires_at, removed_at)
+            VALUES ($id, $guild, $user, $amount, $reason, $contract, $player,
+                    $source, $created, $expires, $removed)
+            ON CONFLICT(id) DO NOTHING;
+            """);
+        Add(command, "$id", entry.Id);
+        Add(command, "$guild", Id(entry.GuildId));
+        Add(command, "$user", Id(entry.DiscordUserId));
+        Add(command, "$amount", entry.Amount);
+        Add(command, "$reason", entry.Reason);
+        Add(command, "$contract", entry.ContractId);
+        Add(command, "$player", entry.PlayerName);
+        Add(command, "$source", entry.SourceKey);
+        Add(command, "$created", Date(entry.CreatedAt));
+        Add(command, "$expires", Date(entry.ExpiresAt));
+        Add(command, "$removed", NullableDate(entry.RemovedAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task InsertFirstCoopAwardAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        FirstCoopAward award) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO first_coop_awards
+                (key, guild_id, contract_id, coop_code, awarded_at)
+            VALUES ($key, $guild, $contract, $coop, $awarded)
+            ON CONFLICT(key) DO NOTHING;
+            """);
+        Add(command, "$key", award.Key);
+        Add(command, "$guild", Id(award.GuildId));
+        Add(command, "$contract", award.ContractId);
+        Add(command, "$coop", award.CoopCode);
+        Add(command, "$awarded", Date(award.AwardedAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task InsertWeeklyTokenPostAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        WeeklyTokenLeaderboardPost post) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO weekly_token_leaderboard_posts (guild_id, week_key, posted_at)
+            VALUES ($guild, $week, $posted)
+            ON CONFLICT(guild_id, week_key) DO NOTHING;
+            """);
+        Add(command, "$guild", Id(post.GuildId));
+        Add(command, "$week", post.WeekKey);
+        Add(command, "$posted", Date(post.PostedAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task InsertLateNoticeAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ContractLateNotice notice) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO contract_late_notices
+                (guild_id, discord_user_id, contract_key, contract_id, eta, note, created_at, expires_at)
+            VALUES ($guild, $user, $contractKey, $contract, $eta, $note, $created, $expires)
+            ON CONFLICT(guild_id, discord_user_id, contract_key) DO UPDATE SET
+                contract_id = excluded.contract_id,
+                eta = excluded.eta,
+                note = excluded.note,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at;
+            """);
+        Add(command, "$guild", Id(notice.GuildId));
+        Add(command, "$user", Id(notice.DiscordUserId));
+        Add(command, "$contractKey", notice.ContractId?.ToUpperInvariant() ?? "");
+        Add(command, "$contract", notice.ContractId);
+        Add(command, "$eta", notice.Eta);
+        Add(command, "$note", notice.Note);
+        Add(command, "$created", Date(notice.CreatedAt));
+        Add(command, "$expires", Date(notice.ExpiresAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task InsertShipNotificationAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ShipReturnNotification notification) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO ship_return_notifications
+                (key, guild_id, discord_user_id, eid_hash, mission_key, ship_name,
+                 return_at, created_at, notified_at)
+            VALUES ($key, $guild, $user, $eid, $mission, $ship, $return, $created, $notified)
+            ON CONFLICT(key) DO UPDATE SET
+                ship_name = excluded.ship_name,
+                return_at = excluded.return_at,
+                created_at = excluded.created_at,
+                notified_at = excluded.notified_at;
+            """);
+        Add(command, "$key", notification.Key);
+        Add(command, "$guild", Id(notification.GuildId));
+        Add(command, "$user", Id(notification.DiscordUserId));
+        Add(command, "$eid", notification.EidHash);
+        Add(command, "$mission", notification.MissionKey);
+        Add(command, "$ship", notification.ShipName);
+        Add(command, "$return", Date(notification.ReturnAt));
+        Add(command, "$created", Date(notification.CreatedAt));
+        Add(command, "$notified", NullableDate(notification.NotifiedAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task<BeerStats?> GetBeerStatsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ulong guildId,
+        ulong discordUserId) {
+        var command = CreateCommand(connection, transaction, """
+            SELECT guild_id, discord_user_id, beers_given_to_bot, beers_bought_by_bot,
+                   first_beer_at, last_beer_at, last_bot_beer_at,
+                   beers_received_from_members, beers_given_to_members,
+                   last_member_beer_received_at, last_member_beer_given_at
+            FROM beer_stats
+            WHERE guild_id = $guild AND discord_user_id = $user LIMIT 1;
+            """);
+        Add(command, "$guild", Id(guildId));
+        Add(command, "$user", Id(discordUserId));
+        await using var reader = await ExecuteReaderPreparedAsync(command);
+        return await reader.ReadAsync() ? ReadBeerStats(reader) : null;
+    }
+
+    private static BeerStats ReadBeerStats(SqliteDataReader reader) =>
+        new(
+            ParseId(reader.GetString(0)),
+            ParseId(reader.GetString(1)),
+            reader.GetInt32(2),
+            reader.GetInt32(3),
+            ParseDate(reader.GetString(4)),
+            ParseDate(reader.GetString(5)),
+            NullableDate(reader, 6),
+            reader.GetInt32(7),
+            reader.GetInt32(8),
+            NullableDate(reader, 9),
+            NullableDate(reader, 10));
+
+    private static async Task UpsertBeerStatsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BeerStats stats) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO beer_stats
+                (guild_id, discord_user_id, beers_given_to_bot, beers_bought_by_bot,
+                 first_beer_at, last_beer_at, last_bot_beer_at,
+                 beers_received_from_members, beers_given_to_members,
+                 last_member_beer_received_at, last_member_beer_given_at)
+            VALUES ($guild, $user, $givenBot, $boughtBot, $first, $last, $lastBot,
+                    $received, $givenMembers, $lastReceived, $lastGiven)
+            ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                beers_given_to_bot = excluded.beers_given_to_bot,
+                beers_bought_by_bot = excluded.beers_bought_by_bot,
+                first_beer_at = excluded.first_beer_at,
+                last_beer_at = excluded.last_beer_at,
+                last_bot_beer_at = excluded.last_bot_beer_at,
+                beers_received_from_members = excluded.beers_received_from_members,
+                beers_given_to_members = excluded.beers_given_to_members,
+                last_member_beer_received_at = excluded.last_member_beer_received_at,
+                last_member_beer_given_at = excluded.last_member_beer_given_at;
+            """);
+        Add(command, "$guild", Id(stats.GuildId));
+        Add(command, "$user", Id(stats.DiscordUserId));
+        Add(command, "$givenBot", stats.BeersGivenToBot);
+        Add(command, "$boughtBot", stats.BeersBoughtByBot);
+        Add(command, "$first", Date(stats.FirstBeerAt));
+        Add(command, "$last", Date(stats.LastBeerAt));
+        Add(command, "$lastBot", NullableDate(stats.LastBotBeerAt));
+        Add(command, "$received", stats.BeersReceivedFromMembers);
+        Add(command, "$givenMembers", stats.BeersGivenToMembers);
+        Add(command, "$lastReceived", NullableDate(stats.LastMemberBeerReceivedAt));
+        Add(command, "$lastGiven", NullableDate(stats.LastMemberBeerGivenAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static async Task<PlottyMemory?> GetPlottyMemoryAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ulong guildId,
+        ulong discordUserId) {
+        var command = CreateCommand(connection, transaction, """
+            SELECT guild_id, discord_user_id, total_interactions, mentions, questions_dodged,
+                   sarcasm_detected, fox_moments, beers, registrations, mood_checks,
+                   excuses, wisdom_requests, first_seen_at, last_seen_at
+            FROM plotty_memories
+            WHERE guild_id = $guild AND discord_user_id = $user LIMIT 1;
+            """);
+        Add(command, "$guild", Id(guildId));
+        Add(command, "$user", Id(discordUserId));
+        await using var reader = await ExecuteReaderPreparedAsync(command);
+        return await reader.ReadAsync() ? ReadPlottyMemory(reader) : null;
+    }
+
+    private static PlottyMemory ReadPlottyMemory(SqliteDataReader reader) =>
+        new(
+            ParseId(reader.GetString(0)),
+            ParseId(reader.GetString(1)),
+            reader.GetInt32(2),
+            reader.GetInt32(3),
+            reader.GetInt32(4),
+            reader.GetInt32(5),
+            reader.GetInt32(6),
+            reader.GetInt32(7),
+            reader.GetInt32(8),
+            reader.GetInt32(9),
+            reader.GetInt32(10),
+            reader.GetInt32(11),
+            ParseDate(reader.GetString(12)),
+            ParseDate(reader.GetString(13)));
+
+    private static async Task UpsertPlottyMemoryAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        PlottyMemory memory) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO plotty_memories
+                (guild_id, discord_user_id, total_interactions, mentions, questions_dodged,
+                 sarcasm_detected, fox_moments, beers, registrations, mood_checks,
+                 excuses, wisdom_requests, first_seen_at, last_seen_at)
+            VALUES ($guild, $user, $total, $mentions, $dodged, $sarcasm, $fox, $beers,
+                    $registrations, $mood, $excuses, $wisdom, $first, $last)
+            ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                total_interactions = excluded.total_interactions,
+                mentions = excluded.mentions,
+                questions_dodged = excluded.questions_dodged,
+                sarcasm_detected = excluded.sarcasm_detected,
+                fox_moments = excluded.fox_moments,
+                beers = excluded.beers,
+                registrations = excluded.registrations,
+                mood_checks = excluded.mood_checks,
+                excuses = excluded.excuses,
+                wisdom_requests = excluded.wisdom_requests,
+                first_seen_at = excluded.first_seen_at,
+                last_seen_at = excluded.last_seen_at;
+            """);
+        Add(command, "$guild", Id(memory.GuildId));
+        Add(command, "$user", Id(memory.DiscordUserId));
+        Add(command, "$total", memory.TotalInteractions);
+        Add(command, "$mentions", memory.Mentions);
+        Add(command, "$dodged", memory.QuestionsDodged);
+        Add(command, "$sarcasm", memory.SarcasmDetected);
+        Add(command, "$fox", memory.FoxMoments);
+        Add(command, "$beers", memory.Beers);
+        Add(command, "$registrations", memory.Registrations);
+        Add(command, "$mood", memory.MoodChecks);
+        Add(command, "$excuses", memory.Excuses);
+        Add(command, "$wisdom", memory.WisdomRequests);
+        Add(command, "$first", Date(memory.FirstSeenAt));
+        Add(command, "$last", Date(memory.LastSeenAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static PlottyConversationState ReadConversation(SqliteDataReader reader) =>
+        new(
+            ParseId(reader.GetString(0)),
+            ParseId(reader.GetString(1)),
+            reader.GetString(2),
+            reader.GetInt32(3),
+            ParseDate(reader.GetString(4)),
+            ParseDate(reader.GetString(5)));
+
+    private static async Task UpsertConversationAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        PlottyConversationState conversation) {
+        var command = CreateCommand(connection, transaction, """
+            INSERT INTO plotty_conversations
+                (guild_id, discord_user_id, last_topic, turns, first_seen_at, last_seen_at)
+            VALUES ($guild, $user, $topic, $turns, $first, $last)
+            ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                last_topic = excluded.last_topic,
+                turns = excluded.turns,
+                first_seen_at = excluded.first_seen_at,
+                last_seen_at = excluded.last_seen_at;
+            """);
+        Add(command, "$guild", Id(conversation.GuildId));
+        Add(command, "$user", Id(conversation.DiscordUserId));
+        Add(command, "$topic", conversation.LastTopic);
+        Add(command, "$turns", conversation.Turns);
+        Add(command, "$first", Date(conversation.FirstSeenAt));
+        Add(command, "$last", Date(conversation.LastSeenAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    private static DemeritEntry ReadDemerit(SqliteDataReader reader) =>
+        new(
+            reader.GetString(0),
+            ParseId(reader.GetString(1)),
+            ParseId(reader.GetString(2)),
+            reader.GetInt32(3),
+            reader.GetString(4),
+            NullableString(reader, 5),
+            NullableString(reader, 6),
+            NullableString(reader, 7),
+            ParseDate(reader.GetString(8)),
+            ParseDate(reader.GetString(9)),
+            NullableDate(reader, 10));
+
+    private static SqliteCommand CreateCommand(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string sql) {
+        var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Transaction = transaction;
+        return command;
+    }
+
+    private static void Add(SqliteCommand command, string name, object? value) =>
+        command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+
+    private static Task<int> ExecuteNonQueryPreparedAsync(SqliteCommand command) {
+        command.Prepare();
+        return command.ExecuteNonQueryAsync();
+    }
+
+    private static Task<object?> ExecuteScalarPreparedAsync(SqliteCommand command) {
+        command.Prepare();
+        return command.ExecuteScalarAsync();
+    }
+
+    private static Task<SqliteDataReader> ExecuteReaderPreparedAsync(SqliteCommand command) {
+        command.Prepare();
+        return command.ExecuteReaderAsync();
+    }
+
+    private static async Task ExecutePreparedStatementsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string sql) {
+        foreach(var statement in sql.Split(
+            ';',
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+            var command = CreateCommand(connection, transaction, statement);
+            await ExecuteNonQueryPreparedAsync(command);
+        }
+    }
+
+    private static string Id(ulong value) => value.ToString(CultureInfo.InvariantCulture);
+    private static ulong ParseId(string value) => ulong.Parse(value, CultureInfo.InvariantCulture);
+    private static string Date(DateTimeOffset value) => value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+    private static object? NullableDate(DateTimeOffset? value) => value is null ? null : Date(value.Value);
+    private static DateTimeOffset ParseDate(string value) =>
+        DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+    private static DateTimeOffset? NullableDate(SqliteDataReader reader, int ordinal) =>
+        reader.IsDBNull(ordinal) ? null : ParseDate(reader.GetString(ordinal));
+    private static string? NullableString(SqliteDataReader reader, int ordinal) =>
+        reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+
+    private static async Task WriteAtomicTextAsync(string path, string content) {
+        var temporaryPath = path + ".tmp";
+        await File.WriteAllTextAsync(temporaryPath, content);
+        File.Move(temporaryPath, path, overwrite: true);
+    }
+
+    private sealed class LegacyState {
         public List<RegisteredEid> RegisteredEids { get; set; } = [];
         public List<DemeritEntry> Demerits { get; set; } = [];
         public List<MissingJoinAlert> MissingJoinAlerts { get; set; } = [];
+        public List<FirstCoopAward> FirstCoopAwards { get; set; } = [];
+        public List<WeeklyTokenLeaderboardPost> WeeklyTokenLeaderboardPosts { get; set; } = [];
         public List<ContractLateNotice> ContractLateNotices { get; set; } = [];
         public List<ShipReturnNotification> ShipReturnNotifications { get; set; } = [];
         public List<BeerStats> BeerStats { get; set; } = [];
@@ -602,4 +1135,147 @@ public sealed class DataStore {
         public List<PlottyMemory> PlottyMemories { get; set; } = [];
         public List<PlottyConversationState> PlottyConversations { get; set; } = [];
     }
+
+    private const string SchemaSql = """
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY COLLATE NOCASE,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS registered_eids (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            eid_hash TEXT NOT NULL COLLATE NOCASE,
+            encrypted_eid TEXT NOT NULL,
+            egg_name TEXT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, eid_hash)
+        );
+        CREATE INDEX IF NOT EXISTS ix_registered_eids_guild_user
+            ON registered_eids (guild_id, discord_user_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS demerits (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            contract_id TEXT NULL,
+            player_name TEXT NULL,
+            source_key TEXT NULL COLLATE NOCASE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            removed_at TEXT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_demerits_active_user
+            ON demerits (guild_id, discord_user_id, removed_at, expires_at);
+        CREATE INDEX IF NOT EXISTS ix_demerits_source
+            ON demerits (guild_id, source_key);
+
+        CREATE TABLE IF NOT EXISTS missing_join_alerts (
+            key TEXT PRIMARY KEY COLLATE NOCASE,
+            posted_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS first_coop_awards (
+            key TEXT PRIMARY KEY COLLATE NOCASE,
+            guild_id TEXT NOT NULL,
+            contract_id TEXT NOT NULL,
+            coop_code TEXT NOT NULL,
+            awarded_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_token_leaderboard_posts (
+            guild_id TEXT NOT NULL,
+            week_key TEXT NOT NULL COLLATE NOCASE,
+            posted_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, week_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS contract_late_notices (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            contract_key TEXT NOT NULL COLLATE NOCASE,
+            contract_id TEXT NULL,
+            eta TEXT NULL,
+            note TEXT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, discord_user_id, contract_key)
+        );
+        CREATE INDEX IF NOT EXISTS ix_contract_late_notices_active
+            ON contract_late_notices (guild_id, contract_id, expires_at);
+
+        CREATE TABLE IF NOT EXISTS ship_return_notifications (
+            key TEXT PRIMARY KEY COLLATE NOCASE,
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            eid_hash TEXT NOT NULL,
+            mission_key TEXT NOT NULL,
+            ship_name TEXT NOT NULL,
+            return_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            notified_at TEXT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_ship_notifications_due
+            ON ship_return_notifications (guild_id, notified_at, return_at);
+
+        CREATE TABLE IF NOT EXISTS beer_stats (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            beers_given_to_bot INTEGER NOT NULL,
+            beers_bought_by_bot INTEGER NOT NULL,
+            first_beer_at TEXT NOT NULL,
+            last_beer_at TEXT NOT NULL,
+            last_bot_beer_at TEXT NULL,
+            beers_received_from_members INTEGER NOT NULL,
+            beers_given_to_members INTEGER NOT NULL,
+            last_member_beer_received_at TEXT NULL,
+            last_member_beer_given_at TEXT NULL,
+            PRIMARY KEY (guild_id, discord_user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS beer_gift_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            giver_discord_user_id TEXT NOT NULL,
+            recipient_discord_user_id TEXT NOT NULL,
+            gifted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_beer_gift_logs_cooldown
+            ON beer_gift_logs (guild_id, giver_discord_user_id, recipient_discord_user_id, gifted_at DESC);
+
+        CREATE TABLE IF NOT EXISTS plotty_memories (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            total_interactions INTEGER NOT NULL,
+            mentions INTEGER NOT NULL,
+            questions_dodged INTEGER NOT NULL,
+            sarcasm_detected INTEGER NOT NULL,
+            fox_moments INTEGER NOT NULL,
+            beers INTEGER NOT NULL,
+            registrations INTEGER NOT NULL,
+            mood_checks INTEGER NOT NULL,
+            excuses INTEGER NOT NULL,
+            wisdom_requests INTEGER NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, discord_user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS plotty_conversations (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            last_topic TEXT NOT NULL,
+            turns INTEGER NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, discord_user_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_plotty_conversations_last_seen
+            ON plotty_conversations (last_seen_at);
+        """;
 }
