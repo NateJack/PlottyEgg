@@ -27,6 +27,7 @@ var shipReturnMonitorsStarted = new HashSet<ulong>();
 var firstCoopAwardMonitorsStarted = new HashSet<ulong>();
 var tokenLeaderboardMonitorsStarted = new HashSet<ulong>();
 const int MaxEggIncAccountConcurrency = 4;
+string[] tokenLeaderboardExcludedNames = ["giger86"];
 
 var client = new DiscordSocketClient(new DiscordSocketConfig {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildMembers | GatewayIntents.GuildMessages | GatewayIntents.MessageContent,
@@ -130,6 +131,12 @@ client.SlashCommandExecuted += async command => {
             case "admin-health":
                 await HandleAdminHealthAsync(command);
                 break;
+            case "admin-plotty-send-demerit":
+                await HandleAdminPlottySendDemeritAsync(command);
+                break;
+            case "admin-remove-demerit":
+                await HandleRemoveDemeritAsync(command);
+                break;
             case "add-demerit":
                 await HandleAddDemeritAsync(command);
                 break;
@@ -174,6 +181,9 @@ client.SlashCommandExecuted += async command => {
                 break;
             case "plotty-wisdom":
                 await HandlePlottyWisdomAsync(command);
+                break;
+            case "plotty-features":
+                await HandlePlottyFeaturesAsync(command);
                 break;
             case "admin-plotty-speak":
                 await HandleAdminPlottySpeakAsync(command);
@@ -373,6 +383,18 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
         .WithDescription("Staff only: show Plotty background monitor health.");
 
     yield return new SlashCommandBuilder()
+        .WithName("admin-plotty-send-demerit")
+        .WithDescription("Staff only: ping a member with a 6hr/18hr demerit notice.")
+        .AddOption("member", ApplicationCommandOptionType.User, "Discord member receiving the demerit notice.", isRequired: true)
+        .AddOption(new SlashCommandOptionBuilder()
+            .WithName("message")
+            .WithDescription("Which demerit notice Plotty should send.")
+            .WithType(ApplicationCommandOptionType.String)
+            .WithRequired(true)
+            .AddChoice("6hr join notice", "6hr")
+            .AddChoice("18hr rate notice", "18hr"));
+
+    yield return new SlashCommandBuilder()
         .WithName("add-demerit")
         .WithDescription("Staff only: add demerits to a member.")
         .AddOption("member", ApplicationCommandOptionType.User, "Discord member.", isRequired: true)
@@ -381,6 +403,12 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
 
     yield return new SlashCommandBuilder()
         .WithName("remove-demerit")
+        .WithDescription("Staff only: remove active demerits from a member.")
+        .AddOption("member", ApplicationCommandOptionType.User, "Discord member.", isRequired: true)
+        .AddOption("amount", ApplicationCommandOptionType.Integer, "Number of demerits. Default is 1.", isRequired: false);
+
+    yield return new SlashCommandBuilder()
+        .WithName("admin-remove-demerit")
         .WithDescription("Staff only: remove active demerits from a member.")
         .AddOption("member", ApplicationCommandOptionType.User, "Discord member.", isRequired: true)
         .AddOption("amount", ApplicationCommandOptionType.Integer, "Number of demerits. Default is 1.", isRequired: false);
@@ -442,6 +470,10 @@ IEnumerable<SlashCommandBuilder> BuildCommands() {
     yield return new SlashCommandBuilder()
         .WithName("plotty-wisdom")
         .WithDescription("Receive a random piece of profound Plotty wisdom.");
+
+    yield return new SlashCommandBuilder()
+        .WithName("plotty-features")
+        .WithDescription("Privately show Plotty's current feature list.");
 
     yield return new SlashCommandBuilder()
         .WithName("admin-plotty-speak")
@@ -1500,7 +1532,10 @@ async Task<IReadOnlyList<TokenLeaderboardEntry>> BuildTokenLeaderboardAsync(
     ulong guildId,
     DateTimeOffset weekStart,
     DateTimeOffset weekEnd) {
-    var accounts = await dataStore.GetRegisteredEidsAsync(guildId);
+    var guild = client.GetGuild(guildId);
+    var accounts = (await dataStore.GetRegisteredEidsAsync(guildId))
+        .Where(account => !IsTokenLeaderboardExcluded(account, guild))
+        .ToList();
     var backups = await GetAccountBackupsAsync(accounts);
     return backups
         .Select(item => {
@@ -1743,6 +1778,49 @@ async Task HandleAddDemeritAsync(SocketSlashCommand command) {
         contractId: null,
         sourceKey: null);
     await command.RespondAsync($"Added `{added}` demerit(s) to {member.Mention}.", ephemeral: true);
+}
+
+async Task HandleAdminPlottySendDemeritAsync(SocketSlashCommand command) {
+    var staffUser = command.User as SocketGuildUser;
+    if(staffUser is null || !HasStaffRole(staffUser)) {
+        await command.RespondAsync("Only members with the Staff role can send demerit notices.", ephemeral: true);
+        return;
+    }
+
+    var member = ResolveGuildMemberOption(command, "member");
+    if(member is null) {
+        await command.RespondAsync("I can only send demerit notices to members in this server.", ephemeral: true);
+        return;
+    }
+
+    var messageType = GetString(command, "message");
+    var (notice, reason) = messageType switch {
+        "6hr" => (
+            "You've failed to meet the guild requirement of joining a contract within 6 hours. 1 demerit has been added to your account.",
+            "Manual staff notice: failed to join within 6 hours"),
+        "18hr" => (
+            "You've failed to meet the guild requirement of 2q/hr after 18 hours. 1 demerit has been added to your account",
+            "Manual staff notice: under 2q/hr after 18 hours"),
+        _ => (
+            "1 demerit has been added to your account.",
+            "Manual staff demerit notice")
+    };
+
+    await dataStore.AddDemeritsAsync(
+        command.GuildId!.Value,
+        member.Id,
+        1,
+        reason,
+        contractId: null,
+        sourceKey: null);
+
+    if(command.Channel is IMessageChannel channel) {
+        await channel.SendMessageAsync(
+            $"{member.Mention} {notice}",
+            allowedMentions: new AllowedMentions { UserIds = [member.Id] });
+    }
+
+    await command.RespondAsync($"Sent the `{messageType}` demerit notice to {member.Mention} and added 1 demerit.", ephemeral: true);
 }
 
 async Task HandleRemoveDemeritAsync(SocketSlashCommand command) {
@@ -2162,6 +2240,66 @@ async Task HandlePlottyExcusesAsync(SocketSlashCommand command) {
 async Task HandlePlottyWisdomAsync(SocketSlashCommand command) {
     var memory = await dataStore.RecordPlottyInteractionAsync(command.GuildId!.Value, command.User.Id, "wisdom");
     await command.RespondAsync(PlottyPersonality.Wisdom(command.User.Mention, memory));
+}
+
+async Task HandlePlottyFeaturesAsync(SocketSlashCommand command) {
+    var embed = new EmbedBuilder()
+        .WithTitle("Plotty Features")
+        .WithColor(Color.Teal)
+        .WithDescription("Here is what I can do right now.")
+        .AddField("Registration & Privacy",
+            string.Join("\n", [
+                "`/register-eid` privately stores one or more Egg Inc IDs for your Discord account.",
+                "`/rates` privately shows your active contracts and recent completed contract count.",
+                "`/player` privately shows recent contribution history for a registered player.",
+                "`/eggs-laid` shows lifetime eggs laid by farm, including regular and virtue eggs."
+            ]))
+        .AddField("Contracts & Alerts",
+            string.Join("\n", [
+                "`/contract` looks up a specific contract and co-op code.",
+                "`/contract-late-notify` tells Staff you may be late joining an upcoming contract.",
+                "Plotty watches `#i-am-late-today` for late notices.",
+                "Background checks watch for 6-hour missing joins, EB rank-ups, ship returns, and first co-op finishes."
+            ]))
+        .AddField("Artifacts, Ships & Help",
+            string.Join("\n", [
+                "`/contract-artifacts` suggests current-contract artifact and stone sets from your inventory.",
+                "`/ships` shows active ship missions and can DM you when one returns.",
+                "`/help` answers Egg Inc questions and can use your registered player data when useful."
+            ]))
+        .AddField("Demerits",
+            string.Join("\n", [
+                "`/demerits-view` privately shows your active demerits.",
+                "Staff can add, remove, view, and send 6hr/18hr demerit notices.",
+                "Demerits expire automatically after 30 days."
+            ]))
+        .AddField("Beverages & Leaderboards",
+            string.Join("\n", [
+                "`/beverage-plotty` lets you give Plotty Water, LaCroix, Soda-Pop, Milk, Coffee, Tea, Beer, or Wine.",
+                "`/beverage-user` lets members gift beverages to each other, optionally pinging the receiver.",
+                "`/beverage-leader` privately shows beverage standings.",
+                "`/token-leaderboard` shows the weekly Tokie Awards for tokens sent."
+            ]))
+        .AddField("Plotty Personality",
+            string.Join("\n", [
+                "`/plotty-mood`, `/plotty-excuses`, and `/plotty-wisdom` generate Plotty-style replies.",
+                "Mention Plotty for conversation replies.",
+                "\"what the fox\" still triggers Plotty's fox response.",
+                "Sarcastic chat replies are intentionally rare."
+            ]))
+        .AddField("Staff Tools",
+            string.Join("\n", [
+                "`/admin-dashboard`, `/admin-rates-all`, and `/admin-member-contract` support contract oversight.",
+                "`/admin-list-members` and `/admin-e9k-compare` compare Discord, Plotty, and EGG9000 membership.",
+                "`/admin-ping-unregistered` pings unregistered server members with a custom message.",
+                "`/admin-plotty-speak` lets Staff speak as Plotty and logs usage to `#mod-log`.",
+                "`/admin-health` shows background monitor health."
+            ]))
+        .WithFooter("Admin commands are Staff restricted. This feature list is private to you.")
+        .WithCurrentTimestamp()
+        .Build();
+
+    await command.RespondAsync(embed: embed, ephemeral: true);
 }
 
 async Task HandleAdminPlottySpeakAsync(SocketSlashCommand command) {
@@ -3114,6 +3252,24 @@ bool HasStaffRole(SocketGuildUser user) =>
 
 bool IsPlottyAdmin(SocketGuildUser user) =>
     plottyAdminUserIds.Contains(user.Id);
+
+bool IsTokenLeaderboardExcluded(RegisteredEggAccount account, SocketGuild? guild) {
+    var member = guild?.GetUser(account.DiscordUserId);
+    var candidateNames = new[] {
+        account.EggName,
+        AccountDisplayName(account),
+        member?.Username,
+        member?.DisplayName,
+        member?.GlobalName
+    };
+
+    var normalizedExcludedNames = tokenLeaderboardExcludedNames
+        .Select(NormalizeName)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    return candidateNames
+        .Select(name => NormalizeName(name))
+        .Any(name => normalizedExcludedNames.Contains(name));
+}
 
 static double Median(IReadOnlyList<double> values) {
     if(values.Count == 0) {
