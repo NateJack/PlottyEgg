@@ -144,6 +144,28 @@ start-bot.bat
 
 The bot stays online only while it is running on this computer.
 
+### Local Egg Inc Worker
+
+Plotty can read Season Contract Score from a private local copy of
+[`tylertms/ei_worker`](https://github.com/tylertms/ei_worker). Install it from the project root:
+
+```powershell
+.\setup-ei-worker.ps1
+```
+
+The protected Egg Inc endpoints require three signing values supplied by the worker owner. Store
+them as Windows user environment variables; do not put them in `appsettings.json` or commit them:
+
+```powershell
+[Environment]::SetEnvironmentVariable("EI_WORKER_MAGIC", "your-value", "User")
+[Environment]::SetEnvironmentVariable("EI_WORKER_INDEX", "your-value", "User")
+[Environment]::SetEnvironmentVariable("EI_WORKER_MARKER", "your-value", "User")
+```
+
+After opening a new PowerShell session, `start-bot.ps1` starts the worker on
+`http://127.0.0.1:8787/`, points Plotty at it, and stops it when Plotty exits. Without those signing
+values, the rest of Plotty remains available but live Season Contract Score is disabled.
+
 ## Discord Invite
 
 Use the bot application's OAuth2 invite URL with these scopes:

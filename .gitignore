@@ -21,6 +21,8 @@ backups/
 # Imported reference material, not part of the runnable bot
 EGG9000-master/
 ImportedBot/
+.reference/
+tools/ei_worker/
 
 # Codex/local workspace files
 .agents/
