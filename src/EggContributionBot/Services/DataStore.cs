@@ -11,7 +11,9 @@ public sealed class DataStore : IDisposable {
     private readonly string _legacyJsonPath;
     private readonly string _connectionString;
     private readonly SecureText _secureText;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private readonly SemaphoreSlim _initializeGate = new(1, 1);
+    private readonly SemaphoreSlim _legacyFileGate = new(1, 1);
     private bool _initialized;
 
     public DataStore(string path, SecureText secureText) {
@@ -36,7 +38,9 @@ public sealed class DataStore : IDisposable {
 
     public void Dispose() {
         SqliteConnection.ClearAllPools();
-        _gate.Dispose();
+        _writeGate.Dispose();
+        _initializeGate.Dispose();
+        _legacyFileGate.Dispose();
     }
 
     public Task SaveRegisteredEidAsync(ulong guildId, ulong discordUserId, string eid, string? eggName) =>
@@ -129,6 +133,49 @@ public sealed class DataStore : IDisposable {
                         null));
             }
             return count;
+        });
+
+    public Task<bool> AddDemeritIfSourceNewAsync(
+        ulong guildId,
+        ulong discordUserId,
+        string reason,
+        string? contractId,
+        string sourceKey,
+        string? playerName = null) =>
+        WriteAsync(async (connection, transaction) => {
+            var now = DateTimeOffset.UtcNow;
+            var exists = CreateCommand(connection, transaction, """
+                SELECT 1
+                FROM demerits
+                WHERE guild_id = $guild
+                  AND source_key = $source
+                  AND removed_at IS NULL
+                  AND expires_at > $now
+                LIMIT 1;
+                """);
+            Add(exists, "$guild", Id(guildId));
+            Add(exists, "$source", sourceKey);
+            Add(exists, "$now", Date(now));
+            if(await ExecuteScalarPreparedAsync(exists) is not null) {
+                return false;
+            }
+
+            await InsertDemeritAsync(
+                connection,
+                transaction,
+                new DemeritEntry(
+                    Guid.NewGuid().ToString("N"),
+                    guildId,
+                    discordUserId,
+                    1,
+                    reason,
+                    contractId,
+                    playerName,
+                    sourceKey,
+                    now,
+                    now.AddDays(30),
+                    null));
+            return true;
         });
 
     public Task<IReadOnlyList<DemeritEntry>> AddAutoDemeritsAsync(
@@ -240,6 +287,106 @@ public sealed class DataStore : IDisposable {
             await ExecuteNonQueryPreparedAsync(command);
         });
 
+    public Task SaveEgg9000ReportSnapshotAsync(
+        ulong guildId,
+        string contractId,
+        string checkpoint,
+        IReadOnlyList<Egg9000ReportSnapshotPlayer> players) =>
+        WriteAsync(async (connection, transaction) => {
+            var now = DateTimeOffset.UtcNow;
+            var cleanup = CreateCommand(connection, transaction, "DELETE FROM egg9000_report_snapshots WHERE captured_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(now.AddDays(-30)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
+
+            var deleteExisting = CreateCommand(connection, transaction, """
+                DELETE FROM egg9000_report_snapshots
+                WHERE guild_id = $guild
+                  AND contract_id = $contract COLLATE NOCASE
+                  AND checkpoint = $checkpoint COLLATE NOCASE;
+                """);
+            Add(deleteExisting, "$guild", Id(guildId));
+            Add(deleteExisting, "$contract", contractId);
+            Add(deleteExisting, "$checkpoint", checkpoint);
+            await ExecuteNonQueryPreparedAsync(deleteExisting);
+
+            foreach(var player in players
+                .Where(p => !string.IsNullOrWhiteSpace(p.PlayerName))
+                .GroupBy(p => NormalizeSnapshotName(p.PlayerName), StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())) {
+                var command = CreateCommand(connection, transaction, """
+                    INSERT INTO egg9000_report_snapshots
+                        (guild_id, contract_id, checkpoint, player_key, player_name, discord_user_id, captured_at)
+                    VALUES ($guild, $contract, $checkpoint, $playerKey, $playerName, $user, $captured);
+                    """);
+                Add(command, "$guild", Id(guildId));
+                Add(command, "$contract", contractId);
+                Add(command, "$checkpoint", checkpoint);
+                Add(command, "$playerKey", NormalizeSnapshotName(player.PlayerName));
+                Add(command, "$playerName", player.PlayerName);
+                Add(command, "$user", player.DiscordUserId is null ? null : Id(player.DiscordUserId.Value));
+                Add(command, "$captured", Date(now));
+                await ExecuteNonQueryPreparedAsync(command);
+            }
+        });
+
+    public Task<IReadOnlyList<Egg9000ReportSnapshotPlayer>> GetEgg9000ReportSnapshotAsync(
+        ulong guildId,
+        string contractId,
+        string checkpoint) =>
+        ReadAsync<IReadOnlyList<Egg9000ReportSnapshotPlayer>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT player_name, discord_user_id
+                FROM egg9000_report_snapshots
+                WHERE guild_id = $guild
+                  AND contract_id = $contract COLLATE NOCASE
+                  AND checkpoint = $checkpoint COLLATE NOCASE;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$contract", contractId);
+            Add(command, "$checkpoint", checkpoint);
+            var result = new List<Egg9000ReportSnapshotPlayer>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                result.Add(new Egg9000ReportSnapshotPlayer(
+                    reader.GetString(0),
+                    reader.IsDBNull(1) ? null : ParseId(reader.GetString(1))));
+            }
+
+            return result;
+        });
+
+    public Task<ulong?> GetNaughtyListThreadIdAsync(ulong guildId, ulong discordUserId) =>
+        ReadAsync<ulong?>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT thread_channel_id
+                FROM naughty_list_threads
+                WHERE guild_id = $guild AND discord_user_id = $user
+                LIMIT 1;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            return await reader.ReadAsync() ? ParseId(reader.GetString(0)) : null;
+        });
+
+    public Task UpsertNaughtyListThreadAsync(ulong guildId, ulong discordUserId, ulong threadChannelId) =>
+        WriteAsync(async (connection, transaction) => {
+            var now = Date(DateTimeOffset.UtcNow);
+            var command = CreateCommand(connection, transaction, """
+                INSERT INTO naughty_list_threads
+                    (guild_id, discord_user_id, thread_channel_id, created_at, updated_at)
+                VALUES ($guild, $user, $thread, $now, $now)
+                ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                    thread_channel_id = excluded.thread_channel_id,
+                    updated_at = excluded.updated_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$user", Id(discordUserId));
+            Add(command, "$thread", Id(threadChannelId));
+            Add(command, "$now", now);
+            await ExecuteNonQueryPreparedAsync(command);
+        });
+
     public Task<bool> HasFirstCoopAwardAsync(string key) =>
         ExistsAsync("SELECT 1 FROM first_coop_awards WHERE key = $key COLLATE NOCASE LIMIT 1;", ("$key", key));
 
@@ -266,6 +413,132 @@ public sealed class DataStore : IDisposable {
             await ExecuteNonQueryPreparedAsync(cleanup);
 
             await InsertWeeklyTokenPostAsync(connection, transaction, post);
+        });
+
+    public Task<FarmerRankSnapshot?> GetFarmerRankSnapshotAsync(ulong guildId, string eidHash) =>
+        ReadAsync<FarmerRankSnapshot?>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT guild_id, discord_user_id, eid_hash, egg_name, rank_oom, rank_name,
+                       earnings_bonus, updated_at
+                FROM farmer_rank_snapshots
+                WHERE guild_id = $guild AND eid_hash = $hash COLLATE NOCASE
+                LIMIT 1;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$hash", eidHash);
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            return await reader.ReadAsync() ? ReadFarmerRankSnapshot(reader) : null;
+        });
+
+    public Task<IReadOnlyList<FarmerRankSnapshot>> GetFarmerRankSnapshotsAsync(ulong guildId) =>
+        ReadAsync<IReadOnlyList<FarmerRankSnapshot>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT guild_id, discord_user_id, eid_hash, egg_name, rank_oom, rank_name,
+                       earnings_bonus, updated_at
+                FROM farmer_rank_snapshots
+                WHERE guild_id = $guild;
+                """);
+            Add(command, "$guild", Id(guildId));
+            var snapshots = new List<FarmerRankSnapshot>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                snapshots.Add(ReadFarmerRankSnapshot(reader));
+            }
+            return snapshots;
+        });
+
+    public Task UpsertFarmerRankSnapshotAsync(FarmerRankSnapshot snapshot) =>
+        WriteAsync(async (connection, transaction) => {
+            await UpsertFarmerRankSnapshotAsync(connection, transaction, snapshot);
+        });
+
+    public Task UpsertFarmerRankSnapshotsAsync(IReadOnlyList<FarmerRankSnapshot> snapshots) =>
+        WriteAsync(async (connection, transaction) => {
+            foreach(var snapshot in snapshots) {
+                await UpsertFarmerRankSnapshotAsync(connection, transaction, snapshot);
+            }
+        });
+
+    private static async Task UpsertFarmerRankSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        FarmerRankSnapshot snapshot) {
+        var command = CreateCommand(connection, transaction, """
+                INSERT INTO farmer_rank_snapshots
+                    (guild_id, discord_user_id, eid_hash, egg_name, rank_oom, rank_name,
+                     earnings_bonus, updated_at)
+                VALUES ($guild, $user, $hash, $name, $oom, $rank, $eb, $updated)
+                ON CONFLICT(guild_id, eid_hash) DO UPDATE SET
+                    discord_user_id = excluded.discord_user_id,
+                    egg_name = excluded.egg_name,
+                    rank_oom = excluded.rank_oom,
+                    rank_name = excluded.rank_name,
+                    earnings_bonus = excluded.earnings_bonus,
+                    updated_at = excluded.updated_at;
+                """);
+        Add(command, "$guild", Id(snapshot.GuildId));
+        Add(command, "$user", Id(snapshot.DiscordUserId));
+        Add(command, "$hash", snapshot.EidHash);
+        Add(command, "$name", snapshot.EggName);
+        Add(command, "$oom", snapshot.RankOom);
+        Add(command, "$rank", snapshot.RankName);
+        Add(command, "$eb", snapshot.EarningsBonus);
+        Add(command, "$updated", Date(snapshot.UpdatedAt));
+        await ExecuteNonQueryPreparedAsync(command);
+    }
+
+    public Task RecordGoldenEggSnapshotsAsync(IReadOnlyList<GoldenEggSnapshot> snapshots) =>
+        WriteAsync(async (connection, transaction) => {
+            var cleanup = CreateCommand(connection, transaction,
+                "DELETE FROM golden_egg_snapshots WHERE captured_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(DateTimeOffset.UtcNow.AddDays(-7)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
+
+            foreach(var snapshot in snapshots) {
+                var command = CreateCommand(connection, transaction, """
+                    INSERT INTO golden_egg_snapshots
+                        (guild_id, discord_user_id, eid_hash, egg_name, golden_eggs_earned, captured_at)
+                    VALUES ($guild, $user, $hash, $name, $earned, $captured)
+                    ON CONFLICT(guild_id, eid_hash, captured_at) DO UPDATE SET
+                        discord_user_id = excluded.discord_user_id,
+                        egg_name = excluded.egg_name,
+                        golden_eggs_earned = excluded.golden_eggs_earned;
+                    """);
+                Add(command, "$guild", Id(snapshot.GuildId));
+                Add(command, "$user", Id(snapshot.DiscordUserId));
+                Add(command, "$hash", snapshot.EidHash);
+                Add(command, "$name", snapshot.EggName);
+                Add(command, "$earned", snapshot.GoldenEggsEarned.ToString(CultureInfo.InvariantCulture));
+                Add(command, "$captured", Date(snapshot.CapturedAt));
+                await ExecuteNonQueryPreparedAsync(command);
+            }
+        });
+
+    public Task<IReadOnlyList<GoldenEggSnapshot>> GetGoldenEggSnapshotsAsync(
+        ulong guildId,
+        string eidHash) =>
+        ReadAsync<IReadOnlyList<GoldenEggSnapshot>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT guild_id, discord_user_id, eid_hash, egg_name,
+                       golden_eggs_earned, captured_at
+                FROM golden_egg_snapshots
+                WHERE guild_id = $guild AND eid_hash = $hash COLLATE NOCASE
+                ORDER BY captured_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$hash", eidHash);
+            var snapshots = new List<GoldenEggSnapshot>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                snapshots.Add(new GoldenEggSnapshot(
+                    ParseId(reader.GetString(0)),
+                    ParseId(reader.GetString(1)),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    ulong.Parse(reader.GetString(4), CultureInfo.InvariantCulture),
+                    ParseDate(reader.GetString(5))));
+            }
+            return snapshots;
         });
 
     public Task<ContractLateNotice> RecordContractLateNoticeAsync(
@@ -418,6 +691,11 @@ public sealed class DataStore : IDisposable {
         bool bypassCooldown = false) =>
         WriteAsync(async (connection, transaction) => {
             var now = DateTimeOffset.UtcNow;
+            var cleanup = CreateCommand(connection, transaction,
+                "DELETE FROM beer_gift_logs WHERE gifted_at < $cutoff;");
+            Add(cleanup, "$cutoff", Date(now.AddDays(-7)));
+            await ExecuteNonQueryPreparedAsync(cleanup);
+
             var giftCommand = CreateCommand(connection, transaction, """
                 SELECT gifted_at
                 FROM beer_gift_logs
@@ -492,6 +770,77 @@ public sealed class DataStore : IDisposable {
             return result;
         });
 
+    public Task SavePendingPollAsync(PendingPoll poll) =>
+        WriteAsync(async (connection, transaction) => {
+            var command = CreateCommand(connection, transaction, """
+                INSERT INTO pending_polls
+                    (key, guild_id, channel_id, message_id, poll_type, title, subtitle,
+                     options_json, emojis_json, end_at, created_at)
+                VALUES ($key, $guild, $channel, $message, $type, $title, $subtitle,
+                        $options, $emojis, $end, $created)
+                ON CONFLICT(key) DO UPDATE SET
+                    guild_id = excluded.guild_id,
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    poll_type = excluded.poll_type,
+                    title = excluded.title,
+                    subtitle = excluded.subtitle,
+                    options_json = excluded.options_json,
+                    emojis_json = excluded.emojis_json,
+                    end_at = excluded.end_at;
+                """);
+            Add(command, "$key", poll.Key);
+            Add(command, "$guild", Id(poll.GuildId));
+            Add(command, "$channel", Id(poll.ChannelId));
+            Add(command, "$message", Id(poll.MessageId));
+            Add(command, "$type", poll.PollType);
+            Add(command, "$title", poll.Title);
+            Add(command, "$subtitle", poll.Subtitle);
+            Add(command, "$options", JsonSerializer.Serialize(poll.Options, JsonOptions));
+            Add(command, "$emojis", JsonSerializer.Serialize(poll.Emojis, JsonOptions));
+            Add(command, "$end", Date(poll.EndAt));
+            Add(command, "$created", Date(poll.CreatedAt));
+            await ExecuteNonQueryPreparedAsync(command);
+        });
+
+    public Task<IReadOnlyList<PendingPoll>> GetDuePendingPollsAsync(ulong guildId, DateTimeOffset now) =>
+        ReadAsync<IReadOnlyList<PendingPoll>>(async connection => {
+            var command = CreateCommand(connection, null, """
+                SELECT key, guild_id, channel_id, message_id, poll_type, title, subtitle,
+                       options_json, emojis_json, end_at, created_at
+                FROM pending_polls
+                WHERE guild_id = $guild AND end_at <= $now
+                ORDER BY end_at;
+                """);
+            Add(command, "$guild", Id(guildId));
+            Add(command, "$now", Date(now));
+            var polls = new List<PendingPoll>();
+            await using var reader = await ExecuteReaderPreparedAsync(command);
+            while(await reader.ReadAsync()) {
+                polls.Add(new PendingPoll(
+                    reader.GetString(0),
+                    ParseId(reader.GetString(1)),
+                    ParseId(reader.GetString(2)),
+                    ParseId(reader.GetString(3)),
+                    reader.GetString(4),
+                    reader.GetString(5),
+                    NullableString(reader, 6),
+                    JsonSerializer.Deserialize<List<string>>(reader.GetString(7), JsonOptions) ?? [],
+                    JsonSerializer.Deserialize<List<string>>(reader.GetString(8), JsonOptions) ?? [],
+                    ParseDate(reader.GetString(9)),
+                    ParseDate(reader.GetString(10))));
+            }
+            return polls;
+        });
+
+    public Task RemovePendingPollAsync(string key) =>
+        WriteAsync(async (connection, transaction) => {
+            var command = CreateCommand(connection, transaction,
+                "DELETE FROM pending_polls WHERE key = $key COLLATE NOCASE;");
+            Add(command, "$key", key);
+            await ExecuteNonQueryPreparedAsync(command);
+        });
+
     public Task<PlottyMemory> RecordPlottyInteractionAsync(
         ulong guildId,
         ulong discordUserId,
@@ -564,7 +913,7 @@ public sealed class DataStore : IDisposable {
         });
 
     public async Task RemoveLegacyPlaintextLinksAsync() {
-        await _gate.WaitAsync();
+        await _legacyFileGate.WaitAsync();
         try {
             await EnsureInitializedAsync();
             if(!File.Exists(_legacyJsonPath)) {
@@ -583,7 +932,7 @@ public sealed class DataStore : IDisposable {
             root.Remove(linksProperty);
             await WriteAtomicTextAsync(_legacyJsonPath, root.ToJsonString(JsonOptions));
         } finally {
-            _gate.Release();
+            _legacyFileGate.Release();
         }
     }
 
@@ -610,14 +959,9 @@ public sealed class DataStore : IDisposable {
     }
 
     private async Task<T> ReadAsync<T>(Func<SqliteConnection, Task<T>> action) {
-        await _gate.WaitAsync();
-        try {
-            await EnsureInitializedAsync();
-            await using var connection = await OpenConnectionAsync();
-            return await action(connection);
-        } finally {
-            _gate.Release();
-        }
+        await EnsureInitializedAsync();
+        await using var connection = await OpenConnectionAsync();
+        return await action(connection);
     }
 
     private async Task WriteAsync(Func<SqliteConnection, SqliteTransaction, Task> action) {
@@ -628,7 +972,7 @@ public sealed class DataStore : IDisposable {
     }
 
     private async Task<T> WriteAsync<T>(Func<SqliteConnection, SqliteTransaction, Task<T>> action) {
-        await _gate.WaitAsync();
+        await _writeGate.WaitAsync();
         try {
             await EnsureInitializedAsync();
             await using var connection = await OpenConnectionAsync();
@@ -637,7 +981,7 @@ public sealed class DataStore : IDisposable {
             await transaction.CommitAsync();
             return result;
         } finally {
-            _gate.Release();
+            _writeGate.Release();
         }
     }
 
@@ -646,15 +990,24 @@ public sealed class DataStore : IDisposable {
             return;
         }
 
-        await using var connection = await OpenConnectionAsync();
-        await ExecutePreparedStatementsAsync(connection, null, SchemaSql);
+        await _initializeGate.WaitAsync();
+        try {
+            if(_initialized) {
+                return;
+            }
 
-        var imported = CreateCommand(connection, null, "SELECT value FROM metadata WHERE key = $key;");
-        Add(imported, "$key", LegacyImportKey);
-        if(await ExecuteScalarPreparedAsync(imported) is null) {
-            await ImportLegacyJsonAsync(connection);
+            await using var connection = await OpenConnectionAsync();
+            await ExecutePreparedStatementsAsync(connection, null, SchemaSql);
+
+            var imported = CreateCommand(connection, null, "SELECT value FROM metadata WHERE key = $key;");
+            Add(imported, "$key", LegacyImportKey);
+            if(await ExecuteScalarPreparedAsync(imported) is null) {
+                await ImportLegacyJsonAsync(connection);
+            }
+            _initialized = true;
+        } finally {
+            _initializeGate.Release();
         }
-        _initialized = true;
     }
 
     private async Task ImportLegacyJsonAsync(SqliteConnection connection) {
@@ -816,6 +1169,17 @@ public sealed class DataStore : IDisposable {
         Add(command, "$posted", Date(post.PostedAt));
         await ExecuteNonQueryPreparedAsync(command);
     }
+
+    private static FarmerRankSnapshot ReadFarmerRankSnapshot(SqliteDataReader reader) =>
+        new(
+            ParseId(reader.GetString(0)),
+            ParseId(reader.GetString(1)),
+            reader.GetString(2),
+            NullableString(reader, 3),
+            reader.GetInt32(4),
+            reader.GetString(5),
+            reader.GetDouble(6),
+            ParseDate(reader.GetString(7)));
 
     private static async Task InsertLateNoticeAsync(
         SqliteConnection connection,
@@ -1106,6 +1470,8 @@ public sealed class DataStore : IDisposable {
     private static string Id(ulong value) => value.ToString(CultureInfo.InvariantCulture);
     private static ulong ParseId(string value) => ulong.Parse(value, CultureInfo.InvariantCulture);
     private static string Date(DateTimeOffset value) => value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+    private static string NormalizeSnapshotName(string value) =>
+        new(value.Trim().ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
     private static object? NullableDate(DateTimeOffset? value) => value is null ? null : Date(value.Value);
     private static DateTimeOffset ParseDate(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
@@ -1178,6 +1544,28 @@ public sealed class DataStore : IDisposable {
             posted_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS egg9000_report_snapshots (
+            guild_id TEXT NOT NULL,
+            contract_id TEXT NOT NULL COLLATE NOCASE,
+            checkpoint TEXT NOT NULL COLLATE NOCASE,
+            player_key TEXT NOT NULL COLLATE NOCASE,
+            player_name TEXT NOT NULL,
+            discord_user_id TEXT NULL,
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, contract_id, checkpoint, player_key)
+        );
+        CREATE INDEX IF NOT EXISTS ix_egg9000_report_snapshots_lookup
+            ON egg9000_report_snapshots (guild_id, contract_id, checkpoint);
+
+        CREATE TABLE IF NOT EXISTS naughty_list_threads (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            thread_channel_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, discord_user_id)
+        );
+
         CREATE TABLE IF NOT EXISTS first_coop_awards (
             key TEXT PRIMARY KEY COLLATE NOCASE,
             guild_id TEXT NOT NULL,
@@ -1192,6 +1580,32 @@ public sealed class DataStore : IDisposable {
             posted_at TEXT NOT NULL,
             PRIMARY KEY (guild_id, week_key)
         );
+
+        CREATE TABLE IF NOT EXISTS farmer_rank_snapshots (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            eid_hash TEXT NOT NULL COLLATE NOCASE,
+            egg_name TEXT NULL,
+            rank_oom INTEGER NOT NULL,
+            rank_name TEXT NOT NULL,
+            earnings_bonus REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, eid_hash)
+        );
+        CREATE INDEX IF NOT EXISTS ix_farmer_rank_snapshots_user
+            ON farmer_rank_snapshots (guild_id, discord_user_id);
+
+        CREATE TABLE IF NOT EXISTS golden_egg_snapshots (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            eid_hash TEXT NOT NULL COLLATE NOCASE,
+            egg_name TEXT NULL,
+            golden_eggs_earned TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, eid_hash, captured_at)
+        );
+        CREATE INDEX IF NOT EXISTS ix_golden_egg_snapshots_lookup
+            ON golden_egg_snapshots (guild_id, eid_hash, captured_at);
 
         CREATE TABLE IF NOT EXISTS contract_late_notices (
             guild_id TEXT NOT NULL,
@@ -1245,6 +1659,22 @@ public sealed class DataStore : IDisposable {
         );
         CREATE INDEX IF NOT EXISTS ix_beer_gift_logs_cooldown
             ON beer_gift_logs (guild_id, giver_discord_user_id, recipient_discord_user_id, gifted_at DESC);
+
+        CREATE TABLE IF NOT EXISTS pending_polls (
+            key TEXT PRIMARY KEY COLLATE NOCASE,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            poll_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            subtitle TEXT NULL,
+            options_json TEXT NOT NULL,
+            emojis_json TEXT NOT NULL,
+            end_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_pending_polls_due
+            ON pending_polls (guild_id, end_at);
 
         CREATE TABLE IF NOT EXISTS plotty_memories (
             guild_id TEXT NOT NULL,

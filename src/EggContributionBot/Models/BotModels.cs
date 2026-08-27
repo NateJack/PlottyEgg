@@ -15,7 +15,35 @@ public sealed record Egg9000LeaderboardItem(
     double EggsOfProphecy,
     double MER,
     double EggsOfTruth,
-    double NumPrestiges);
+    double NumPrestiges,
+    double TotalCS = 0,
+    double SeasonCS = 0);
+public sealed record Egg9000ContractPlayer(
+    string Name,
+    string? GuildTag,
+    string Chickens,
+    string Rate,
+    double RatePerHour,
+    string Projected,
+    bool Joined,
+    string CoopStatus = "",
+    bool CoopFinished = false);
+public sealed record Egg9000ContractScrape(
+    string ContractId,
+    int League,
+    IReadOnlyList<Egg9000ContractPlayer> Players,
+    bool LooksLikeLoginPage = false,
+    bool HasEmbeddedContractData = false);
+public sealed record Egg9000ReportPlayer(
+    string PlayerName,
+    string? GuildTag,
+    string Chickens,
+    string Rate,
+    double RatePerHour,
+    string Projected,
+    bool Joined,
+    ulong? DiscordUserId,
+    bool CoopFinished = false);
 public sealed record PlayerContractCandidate(string ContractId, string CoopCode, double AcceptedAt);
 public sealed record ContractFarmSnapshot(int Index, Backup.Types.Simulation Farm);
 public sealed record PlayerContractRate(string ContractId, double RatePerHour, double ContributionAmount);
@@ -87,9 +115,43 @@ public sealed record AutoDemeritCandidate(ulong DiscordUserId, string ContractId
 public sealed record MissingJoinAccountSnapshot(RegisteredEggAccount Account, IReadOnlySet<string> JoinedContractIds);
 public sealed record MissingJoinMember(ulong DiscordUserId, string Label, IReadOnlyList<RegisteredEggAccount> Accounts);
 public sealed record MissingJoinAlert(string Key, DateTimeOffset PostedAt);
+public sealed record Egg9000ReportSnapshotPlayer(string PlayerName, ulong? DiscordUserId);
 public sealed record FirstCoopAward(string Key, ulong GuildId, string ContractId, string CoopCode, DateTimeOffset AwardedAt);
 public sealed record WeeklyTokenLeaderboardPost(ulong GuildId, string WeekKey, DateTimeOffset PostedAt);
+public sealed record FarmerRankSnapshot(
+    ulong GuildId,
+    ulong DiscordUserId,
+    string EidHash,
+    string? EggName,
+    int RankOom,
+    string RankName,
+    double EarningsBonus,
+    DateTimeOffset UpdatedAt);
+public sealed record GoldenEggSnapshot(
+    ulong GuildId,
+    ulong DiscordUserId,
+    string EidHash,
+    string? EggName,
+    ulong GoldenEggsEarned,
+    DateTimeOffset CapturedAt);
 public sealed record TokenLeaderboardEntry(ulong DiscordUserId, string PlayerName, uint TokensSent, int ContractCount);
+public sealed record PlayerContractScoreSnapshot(
+    IReadOnlyList<ContractEvaluation> Evaluations,
+    ContractPlayerInfo? PlayerInfo);
+public sealed record RivalrySnapshot(
+    RegisteredEggAccount Account,
+    string PlayerName,
+    double EarningsBonus,
+    double SoulEggs,
+    double ProphecyEggs,
+    string FarmerRank,
+    double TotalEggsLaid,
+    string TopEggName,
+    double TopEggAmount,
+    int ActiveContracts,
+    int CompletedContracts,
+    int ActiveShips);
+public sealed record RivalryCategory(string Label, string Left, string Right, int Winner);
 public sealed record FirstCoopCandidate(
     RegisteredEggAccount Account,
     string ContractId,
@@ -124,7 +186,14 @@ public sealed record ShipReturnNotification(
     DateTimeOffset? NotifiedAt) {
     public string Key => $"{GuildId}:{DiscordUserId}:{EidHash}:{MissionKey}";
 }
-public sealed record EggsLaidTotal(string Name, double Amount);
+public enum EggsLaidGroup {
+    Regular,
+    Virtue,
+    Seasonal,
+    Custom
+}
+
+public sealed record EggsLaidTotal(string Name, double Amount, EggsLaidGroup Group);
 public sealed record BeerStats(
     ulong GuildId,
     ulong DiscordUserId,
@@ -161,6 +230,18 @@ public sealed record PlottyConversationState(
     int Turns,
     DateTimeOffset FirstSeenAt,
     DateTimeOffset LastSeenAt);
+public sealed record PendingPoll(
+    string Key,
+    ulong GuildId,
+    ulong ChannelId,
+    ulong MessageId,
+    string PollType,
+    string Title,
+    string? Subtitle,
+    IReadOnlyList<string> Options,
+    IReadOnlyList<string> Emojis,
+    DateTimeOffset EndAt,
+    DateTimeOffset CreatedAt);
 public sealed record DemeritEntry(
     string Id,
     ulong GuildId,

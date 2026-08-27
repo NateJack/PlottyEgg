@@ -1,5 +1,6 @@
 using EggContribBot;
 using EggContribBot.Proto;
+using Google.Protobuf;
 using Microsoft.Data.Sqlite;
 using System.Globalization;
 using System.Text.Json;
@@ -11,6 +12,13 @@ if(args is ["--audit-migration", var legacyJsonPath, var databasePath]) {
 
 var tests = new (string Name, Func<Task> Run)[] {
     ("Discord settings parse guild and admin IDs", TestDiscordSettingsParsing),
+    ("Egg Inc periodicals parse season score when player info is present", TestEggIncNativePeriodicalsSeasonScore),
+    ("Egg Inc local worker maps season contract score", TestEggIncWorkerSeasonScore),
+    ("Egg Inc signed player-info request matches Inspector transport", TestEggIncSignedPlayerInfoRequest),
+    ("Egg Inc client learns newer versions from backups", TestEggIncLearnsClientVersionFromBackup),
+    ("Egg Inc backup requests are coalesced and cached", TestEggIncBackupCache),
+    ("EGG9000 leaderboard requests are cached", TestEgg9000LeaderboardCache),
+    ("EGG9000 completed co-ops are recognized for report filtering", TestEgg9000CompletedCoopStatus),
     ("Plotty AI redacts private credentials from chat prompts", TestPlottyAiPromptRedaction),
     ("Plotty AI has a no-key local conversation fallback", TestPlottyAiLocalFallback),
     ("Plotty AI local fallback answers greetings naturally", TestPlottyAiLocalGreeting),
@@ -19,17 +27,28 @@ var tests = new (string Name, Func<Task> Run)[] {
     ("DataStore removes legacy plaintext link records", TestLegacyPlaintextLinksRemoved),
     ("DataStore imports legacy JSON exactly once", TestLegacyJsonMigration),
     ("DataStore persists SQLite state across reopen", TestSqlitePersistence),
+    ("DataStore tracks Golden Egg history per EID", TestGoldenEggSnapshots),
     ("DataStore serializes concurrent writes", TestConcurrentDataStoreWrites),
+    ("DataStore supports concurrent reads while writing", TestConcurrentDataStoreReads),
     ("Demerits can be added, viewed, and removed", TestDemerits),
     ("Late notices filter by contract and expire window", TestContractLateNotices),
     ("Beer cooldowns can be enforced and bypassed", TestBeerCooldowns),
     ("Ship return notifications become due and can be marked sent", TestShipReturnNotifications),
+    ("Pending polls persist until removed", TestPendingPolls),
     ("Monitor health records success and failure state", TestMonitorHealth),
     ("Co-op artifact reports include other members", TestCoopArtifactReports),
     ("Artifact scoring uses live co-op production", TestCoopArtifactScoring),
     ("Tokie Awards use Monday 10 AM weekly boundaries", TestTokenLeaderboardWeek),
     ("Tokie Awards count each weekly co-op once", TestTokenLeaderboardTokens)
 };
+
+static Task TestEgg9000CompletedCoopStatus() {
+    AssertTrue(Egg9000Client.IsCompletedCoopStatus("Finished", 12), "finished status");
+    AssertTrue(Egg9000Client.IsCompletedCoopStatus("Complete once everyone checks in", 3), "completed waiting for check-in");
+    AssertTrue(Egg9000Client.IsCompletedCoopStatus("Time to complete 0m", 0), "expired co-op timer");
+    AssertTrue(!Egg9000Client.IsCompletedCoopStatus("Time to complete 1h", 1), "active co-op");
+    return Task.CompletedTask;
+}
 
 var failed = 0;
 foreach(var test in tests) {
@@ -62,6 +81,190 @@ static Task TestDiscordSettingsParsing() {
     AssertEqual("https://egg9000.com/", egg9000.EffectiveBaseUrl, "egg9000 base url");
     AssertEqual("gpt-5-nano", openAi.EffectiveModel, "lowest-cost OpenAI model default");
     return Task.CompletedTask;
+}
+
+static async Task TestEggIncNativePeriodicalsSeasonScore() {
+    var periodicals = new PeriodicalsResponse {
+        ContractPlayerInfo = new ContractPlayerInfo {
+            SeasonCxp = 5678,
+            TotalCxp = 9012
+        }
+    };
+    var authenticated = new AuthenticatedMessage {
+        Message = ByteString.CopyFrom(periodicals.ToByteArray()),
+        Compressed = false
+    };
+    var handler = new StubHttpMessageHandler(request => {
+        AssertEqual("https://ctx-dot-auxbrainhome.appspot.com/ei/get_periodicals", request.RequestUri?.ToString(), "periodicals request URL");
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+            Content = new StringContent(Convert.ToBase64String(authenticated.ToByteArray()))
+        };
+    });
+    using var http = new HttpClient(handler) {
+        BaseAddress = new Uri("https://www.auxbrain.com/"),
+        Timeout = TimeSpan.FromSeconds(2)
+    };
+    var client = new EggIncClient(new EggIncApiSettings(), http);
+
+    var snapshot = await client.GetPlayerContractScoreSnapshotAsync("ei123", backup: null);
+
+    AssertTrue(snapshot.PlayerInfo is not null, "native periodicals player info returned");
+    AssertEqual(5678D, snapshot.PlayerInfo!.SeasonCxp, "native season contract score");
+    AssertEqual(9012D, snapshot.PlayerInfo.TotalCxp, "native total contract score");
+}
+
+static async Task TestEggIncWorkerSeasonScore() {
+    var handler = new StubHttpMessageHandler(request => {
+        AssertEqual("http://127.0.0.1:8787/player_summary?eid=EI123", request.RequestUri?.ToString(), "worker request URL");
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+            Content = new StringContent(
+                """
+                {"contracts":{"grade":{"id":5},"grade_progress":0.75,"grade_score":1234,"season_cxp":5678,"total_cxp":9012}}
+                """,
+                System.Text.Encoding.UTF8,
+                "application/json")
+        };
+    });
+    using var http = new HttpClient(handler) {
+        BaseAddress = new Uri("https://www.auxbrain.com/"),
+        Timeout = TimeSpan.FromSeconds(2)
+    };
+    var client = new EggIncClient(
+        new EggIncApiSettings(WorkerUrl: "http://127.0.0.1:8787"),
+        http);
+
+    var info = await client.GetContractPlayerInfoAsync("ei123");
+
+    AssertTrue(info is not null, "worker player info returned");
+    AssertEqual(5678D, info!.SeasonCxp, "season contract score");
+    AssertEqual(9012D, info.TotalCxp, "total contract score");
+    AssertEqual(1234D, info.GradeScore, "grade score");
+    AssertEqual(Contract.Types.PlayerGrade.GradeAaa, info.Grade, "contract grade");
+}
+
+static async Task TestEggIncSignedPlayerInfoRequest() {
+    const string salt = "inspector-parity-test";
+    var responseInfo = new ContractPlayerInfo { SeasonCxp = 4321 };
+    var responseEnvelope = new AuthenticatedMessage {
+        Message = ByteString.CopyFrom(responseInfo.ToByteArray())
+    };
+    var handler = new StubHttpMessageHandler(request => {
+        AssertEqual("https://www.auxbrain.com/ei_ctx/get_contract_player_info", request.RequestUri?.ToString(), "signed player-info URL");
+        var form = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+        var encoded = form.Split('=', 2)[1];
+        var envelope = AuthenticatedMessage.Parser.ParseFrom(Convert.FromBase64String(Uri.UnescapeDataString(encoded)));
+        var requestInfo = BasicRequestInfo.Parser.ParseFrom(envelope.Message);
+
+        AssertEqual("EI123", requestInfo.EiUserId, "signed EID");
+        AssertEqual(75U, requestInfo.ClientVersion, "current client version");
+        AssertEqual("1.37", requestInfo.Version, "current app version");
+        AssertEqual("111358", requestInfo.Build, "current app build");
+        AssertEqual("DROID", requestInfo.Platform, "Inspector platform");
+        AssertEqual("en", requestInfo.DeviceLanguage, "Inspector device language");
+        AssertEqual(InspectorSignature(envelope.Message.ToByteArray(), salt), envelope.Code, "Inspector signature");
+
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+            Content = new StringContent(Convert.ToBase64String(responseEnvelope.ToByteArray()))
+        };
+    });
+    using var http = new HttpClient(handler) {
+        BaseAddress = new Uri("https://www.auxbrain.com/"),
+        Timeout = TimeSpan.FromSeconds(2)
+    };
+    var client = new EggIncClient(new EggIncApiSettings(Salt: salt), http);
+
+    var info = await client.GetContractPlayerInfoAsync("ei123");
+
+    AssertTrue(info is not null, "signed player info returned");
+    AssertEqual(4321D, info!.SeasonCxp, "signed player-info response parsed");
+}
+
+static string InspectorSignature(byte[] messageBytes, string phrase) {
+    var mutated = messageBytes.ToArray();
+    const uint magic = 0x3b9af419;
+    if(mutated.Length > 0) {
+        mutated[magic % (uint)mutated.Length] = 0x1b;
+    }
+
+    var saltHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+        System.Text.Encoding.ASCII.GetBytes(phrase))).ToLowerInvariant();
+    var combined = mutated.Concat(System.Text.Encoding.ASCII.GetBytes(saltHash)).ToArray();
+    return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(combined)).ToLowerInvariant();
+}
+
+static async Task TestEggIncLearnsClientVersionFromBackup() {
+    uint observedClientVersion = 0;
+    var firstContact = new EggIncFirstContactResponse {
+        Backup = new Backup { UserName = "Updated Player", Version = 76 }
+    };
+    var handler = new StubHttpMessageHandler(request => {
+        if(request.RequestUri?.AbsolutePath.EndsWith("/ei/bot_first_contact", StringComparison.Ordinal) == true) {
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+                Content = new StringContent(Convert.ToBase64String(firstContact.ToByteArray()))
+            };
+        }
+
+        var form = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+        var encoded = form.Split('=', 2)[1];
+        var coopRequest = ContractCoopStatusRequest.Parser.ParseFrom(
+            Convert.FromBase64String(Uri.UnescapeDataString(encoded)));
+        observedClientVersion = coopRequest.ClientVersion;
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+            Content = new StringContent(Convert.ToBase64String(new ContractCoopStatusResponse().ToByteArray()))
+        };
+    });
+    using var http = new HttpClient(handler) {
+        BaseAddress = new Uri("https://www.auxbrain.com/"),
+        Timeout = TimeSpan.FromSeconds(2)
+    };
+    var client = new EggIncClient(new EggIncApiSettings(), http);
+
+    await client.GetBackupAsync("ei123");
+    await client.GetCoopStatusAsync("contract", "coop");
+
+    AssertEqual(76U, observedClientVersion, "learned client version");
+}
+
+static async Task TestEggIncBackupCache() {
+    var requestCount = 0;
+    var firstContact = new EggIncFirstContactResponse {
+        Backup = new Backup { UserName = "Cached Player" }
+    };
+    var responseBody = Convert.ToBase64String(firstContact.ToByteArray());
+    var handler = new StubHttpMessageHandler(_ => {
+        Interlocked.Increment(ref requestCount);
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+            Content = new StringContent(responseBody)
+        };
+    });
+    using var http = new HttpClient(handler) {
+        BaseAddress = new Uri("https://www.auxbrain.com/"),
+        Timeout = TimeSpan.FromSeconds(2)
+    };
+    var client = new EggIncClient(new EggIncApiSettings(), http);
+
+    var backups = await Task.WhenAll(Enumerable.Range(0, 12)
+        .Select(_ => client.GetBackupAsync("ei123")));
+
+    AssertEqual(1, requestCount, "first-contact request count");
+    AssertTrue(backups.All(backup => backup?.UserName == "Cached Player"), "all callers receive cached backup");
+}
+
+static async Task TestEgg9000LeaderboardCache() {
+    var requestCount = 0;
+    var handler = new StubHttpMessageHandler(_ => {
+        Interlocked.Increment(ref requestCount);
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK) {
+            Content = new StringContent("[]", System.Text.Encoding.UTF8, "application/json")
+        };
+    });
+    using var http = new HttpClient(handler);
+    var client = new Egg9000Client(new Egg9000Settings("https://egg9000.test/", "test-key"), http);
+
+    await client.GetLeaderboardAsync();
+    await client.GetLeaderboardAsync();
+
+    AssertEqual(1, requestCount, "EGG9000 leaderboard request count");
 }
 
 static async Task AuditMigrationAsync(string legacyJsonPath, string databasePath) {
@@ -313,6 +516,25 @@ static async Task TestSqlitePersistence() {
     AssertEqual(1, leaderboard.Single().BeersBoughtByBot, "reopened beverage count");
 }
 
+static async Task TestGoldenEggSnapshots() {
+    using var fixture = new StoreFixture();
+    var now = DateTimeOffset.UtcNow;
+    await fixture.Store.RecordGoldenEggSnapshotsAsync([
+        new GoldenEggSnapshot(1, 10, "hash-a", "Primary", 1_000, now.AddHours(-25)),
+        new GoldenEggSnapshot(1, 10, "hash-a", "Primary", 1_250, now),
+        new GoldenEggSnapshot(1, 10, "hash-b", "Alt", 500, now)
+    ]);
+
+    fixture.ReopenStore();
+    var primary = await fixture.Store.GetGoldenEggSnapshotsAsync(1, "hash-a");
+    var alt = await fixture.Store.GetGoldenEggSnapshotsAsync(1, "hash-b");
+
+    AssertEqual(2, primary.Count, "primary EID snapshot count");
+    AssertEqual(1_000UL, primary[0].GoldenEggsEarned, "oldest earned counter");
+    AssertEqual(1_250UL, primary[1].GoldenEggsEarned, "latest earned counter");
+    AssertEqual(1, alt.Count, "alternate EID remains separate");
+}
+
 static async Task TestConcurrentDataStoreWrites() {
     using var fixture = new StoreFixture();
     await Task.WhenAll(Enumerable.Range(0, 20).Select(index =>
@@ -320,6 +542,19 @@ static async Task TestConcurrentDataStoreWrites() {
 
     var active = await fixture.Store.GetActiveDemeritsAsync(1, 10);
     AssertEqual(20, active.Count, "concurrent demerit count");
+}
+
+static async Task TestConcurrentDataStoreReads() {
+    using var fixture = new StoreFixture();
+    await fixture.Store.SaveRegisteredEidAsync(1, 10, "ei_reader", "Reader");
+    var reads = Enumerable.Range(0, 20)
+        .Select(_ => fixture.Store.GetRegisteredEidsAsync(1));
+    var write = fixture.Store.AddDemeritsAsync(1, 10, 1, "parallel", null, null);
+
+    var results = await Task.WhenAll(reads);
+    await write;
+
+    AssertTrue(results.All(accounts => accounts.Count == 1), "concurrent reads return registered account");
 }
 
 static async Task TestDemerits() {
@@ -387,6 +622,33 @@ static async Task TestShipReturnNotifications() {
     due = await fixture.Store.GetDueShipReturnNotificationsAsync(1, now.AddMinutes(1));
 
     AssertEqual(0, due.Count, "sent notification no longer due");
+}
+
+static async Task TestPendingPolls() {
+    using var fixture = new StoreFixture();
+    var now = DateTimeOffset.UtcNow;
+    var poll = new PendingPoll(
+        "poll:123",
+        1,
+        2,
+        123,
+        "general",
+        "Test poll",
+        null,
+        ["One", "Two"],
+        ["1", "2"],
+        now.AddMinutes(-1),
+        now.AddHours(-1));
+
+    await fixture.Store.SavePendingPollAsync(poll);
+    fixture.ReopenStore();
+    var due = await fixture.Store.GetDuePendingPollsAsync(1, now);
+    AssertEqual(1, due.Count, "persisted due poll count");
+    AssertSequenceEqual(poll.Options, due[0].Options, "persisted poll options");
+
+    await fixture.Store.RemovePendingPollAsync(poll.Key);
+    due = await fixture.Store.GetDuePendingPollsAsync(1, now);
+    AssertEqual(0, due.Count, "removed due poll count");
 }
 
 static Task TestMonitorHealth() {
@@ -568,4 +830,11 @@ sealed class StoreFixture : IDisposable {
             Directory.Delete(_dir, recursive: true);
         }
     }
+}
+
+sealed class StubHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler {
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(responder(request));
 }
